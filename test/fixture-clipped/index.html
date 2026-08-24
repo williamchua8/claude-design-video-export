@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Clipped-glow fixture</title>
+<!-- Validation fixture for the doctor's glow measurement.
+     LEFT  : a blurred radial glow rendered normally  -> should measure ~1.0
+     RIGHT : the identical glow inside an overflow:hidden box, so it is cut off
+             at the rectangle -> should measure ~1.41, the same signature the
+             headless-shell compositing bug produces. -->
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden}
+  #stage{position:relative;background:#05060a}
+  .glow{position:absolute;width:300px;height:300px;border-radius:50%;
+        background:#4f8cff;filter:blur(70px)}
+  #clipbox{position:absolute;left:760px;top:210px;width:300px;height:300px;
+           overflow:hidden}                     /* <-- the clip that squares it */
+  #clipbox .glow{left:0;top:0}
+</style>
+<div id="stage" width="1280" height="720"
+     data-om-exportable-video-with-duration-secs="2"
+     data-om-fonts-inlined="true"
+     style="width:1280px;height:720px">
+  <div class="glow" style="left:220px;top:210px"></div>
+  <div id="clipbox"><div class="glow"></div></div>
+</div>

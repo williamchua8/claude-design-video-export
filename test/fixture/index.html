@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CDV test fixture</title>
+<style>
+  html,body{margin:0;height:100%;background:#07080c;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  #bar{position:absolute;left:0;right:0;bottom:0;height:56px;background:#111}
+  #stage{position:relative;background:#07080c;transform-origin:center center;
+         overflow:hidden;will-change:transform}
+
+  /* A composited 3D subtree, exactly like a real Claude Design card stack. */
+  .layer{position:absolute;transform-style:preserve-3d;will-change:transform,opacity}
+
+  /* GLOW A: blurred radial. Under the headless shell, or when a transform scales
+     the layer instead of raising device density, this clips to a rectangle. */
+  #glow{position:absolute;width:360px;height:360px;border-radius:50%;
+        background:#4f8cff;filter:blur(90px);opacity:.85}
+
+  /* GLOW B: pure radial-gradient, no filter. Control case. */
+  #grad{position:absolute;width:300px;height:300px;
+        background:radial-gradient(circle closest-side,#ff5fa2 0%,rgba(255,95,162,0) 100%)}
+
+  /* WALL-CLOCK MOTION 1: a CSS ambient loop. Nothing tells it about the seek. */
+  #pulse{position:absolute;width:120px;height:120px;border-radius:24px;background:#26e0a3;
+         animation:pulse 1.7s linear infinite}
+  @keyframes pulse{
+    0%{transform:scale(.6) rotate(0deg);opacity:.35}
+    50%{transform:scale(1.25) rotate(180deg);opacity:1}
+    100%{transform:scale(.6) rotate(360deg);opacity:.35}
+  }
+
+  /* WALL-CLOCK MOTION 2: a requestAnimationFrame ticker. */
+  #spin{position:absolute;width:90px;height:90px;background:#ffd166;border-radius:12px}
+
+  /* SEEK-DRIVEN MOTION: the only thing a naive renderer gets right. */
+  #box{position:absolute;width:110px;height:110px;background:#fff;border-radius:14px}
+
+  #label{position:absolute;left:24px;top:20px;font:600 22px/1.2 system-ui,sans-serif;color:#dfe6f5}
+</style>
+
+<div id="wrap"><div id="stage"
+     width="1280" height="720"
+     data-om-exportable-video-with-duration-secs="4"
+     data-om-sync-seek="true"
+     data-om-fonts-inlined="true">
+  <div class="layer" style="inset:0">
+    <div id="glow"  style="left:120px;  top:180px"></div>
+    <div id="grad"  style="right:140px; top:210px"></div>
+    <div id="pulse" style="left:560px;  top:120px"></div>
+    <div id="spin"  style="left:600px;  top:470px"></div>
+    <div id="box"   style="top:300px"></div>
+    <div id="label">t = 0.000</div>
+  </div>
+</div></div>
+<div id="bar"></div>
+
+<script>
+(() => {
+  const stage = document.getElementById('stage');
+  const W = 1280, H = 720, DUR = 4, BAR = 56;
+
+  // Mimic the real runtime's self-scaling: fit into the viewport minus a bar.
+  function measure() {
+    const s = Math.min(innerWidth / W, (innerHeight - BAR) / H);
+    stage.style.width = W + 'px';
+    stage.style.height = H + 'px';
+    stage.style.transform = 'scale(' + s + ')';
+  }
+  addEventListener('resize', measure); measure();
+
+  // --- seek-driven (pure function of t) ------------------------------------
+  function applySeek(t) {
+    const u = Math.max(0, Math.min(1, t / DUR));
+    document.getElementById('box').style.left = (60 + u * 1000) + 'px';
+    document.getElementById('label').textContent = 't = ' + t.toFixed(3);
+    // A glow that also travels, so blur quality is testable while moving.
+    document.getElementById('glow').style.top = (150 + Math.sin(u * Math.PI * 2) * 60) + 'px';
+  }
+  stage.addEventListener('data-om-seek-to-time-frame', (e) => applySeek(e.detail.time));
+  applySeek(0);
+
+  // --- wall-clock motion 2: rAF ticker --------------------------------------
+  // Deliberately reads performance.now(), the way most real code does.
+  const spin = document.getElementById('spin');
+  function tick() {
+    const ms = performance.now();
+    spin.style.transform = 'rotate(' + (ms / 8) % 360 + 'deg)';
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
