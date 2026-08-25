@@ -18,11 +18,13 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { resolveInput, autoDetect, startServer } from './lib/input.js';
+import { withTimes, resolveSelection, printScenes, scenesTotal } from './lib/scenes.js';
 import { probeProject } from './lib/probe.js';
 import { computeGeometry } from './lib/capture.js';
 import { render, framesDirFor } from './lib/pipeline.js';
 import { QUALITY_PROFILES, ffmpegBin, findAudio } from './lib/encode.js';
 import { runDoctor } from './lib/doctor.js';
+import { ANGLE_BACKENDS } from './lib/browser.js';
 import { c, fmtDuration, clamp, even } from './lib/util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,6 +66,12 @@ const OPT = {
   freezeTimers: has('--freeze-timers'),
   raster:    has('--software') ? 'software' : val('--raster', 'gpu'),
   channel:   val('--channel', null),
+  angle:     val('--angle', null),         // default|d3d11|d3d9|gl|vulkan|swiftshader
+  entry:     val('--entry', null),         // which bundle inside a zip/folder
+  scene:     val('--scene', null),         // "IPAM" | "3" | "2-4" | "ipam,close"
+  listScenes: has('--list-scenes'),
+  noSweep:   has('--no-sweep'),
+  paintDeterminism: has('--paint-determinism'),
   quality:   val('--quality', 'master'),
   preset:    val('--preset', 'slow'),
   crf:       val('--crf', null) ? parseInt(val('--crf'), 10) : null,
@@ -101,10 +109,20 @@ ${c.b('Output')}
   --quality master|delivery|h265|prores
   --crf <n>  --preset <x264 preset>  --10bit
 
+${c.b('Choosing what to render')}
+  --entry <rel path>        which bundle inside a folder/zip (a Claude Code zip
+                            often holds several videos). Omit to be asked.
+  --list-scenes             print the composition's scenes and exit
+  --scene <sel>             render only part of the timeline. Accepts a scene
+                            name, a 1-based number, a range or a list:
+                              --scene IPAM      --scene 3
+                              --scene 2-4       --scene "ipam,close"
+
 ${c.b('Quality / correctness')}
-  --scale-mode dpr|layout   dpr (default) raises device pixel ratio; layout
-                            scales the stage with a CSS transform. dpr is what
-                            keeps blurred glows radial instead of boxy.
+  --scale-mode dpr|layout   dpr (default) raises device pixel ratio so the stage
+                            never scales; layout scales the stage with a CSS
+                            transform. Identical when the composition is authored
+                            at the export resolution.
   --time absolute|replay|off
                             absolute (default) pins every CSS/rAF animation to
                             the seek time. replay also steps through the
@@ -114,6 +132,16 @@ ${c.b('Quality / correctness')}
   --raster gpu|software     (--software is shorthand)
   --freeze-timers           also virtualise setTimeout/setInterval
   --verify                  re-render every frame and compare (slow)
+  --angle <backend>         graphics backend: ${ANGLE_BACKENDS.join(' | ')}.
+                            If a glow renders as a rectangle on your machine but
+                            looks right elsewhere, try --angle swiftshader: it
+                            bypasses the GPU driver entirely.
+  --no-sweep                skip the one-frame paint-dropout check (on by
+                            default; it is what stops elements blinking)
+  --paint-determinism       extra compositor flags that force paint to finish
+                            before capture. Off by default: they can deadlock
+                            the screenshot call, and the dropout sweep already
+                            covers what they were meant to prevent.
 
 ${c.b('Speed')}
   --jobs <n>                parallel workers
@@ -186,14 +214,20 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     scaleMode: overrides.scaleMode ?? OPT.scaleMode,
   });
 
-  const duration = project.duration;
+  // A scene selection narrows the render to one slice of the timeline. Frame i
+  // of the output maps to timeOffset + i/fps on the composition's own clock.
+  const window = overrides.window || null;
+  const timeOffset = window ? window.start : 0;
+  const duration = window ? (window.end - window.start) : project.duration;
   const totalFrames = Math.max(1, Math.round(duration * fps));
   const quality = overrides.quality ?? OPT.quality;
   const ext = (QUALITY_PROFILES[quality] || QUALITY_PROFILES.master).ext;
 
+  const sceneTag = window && window.names && window.names.length
+    ? '_' + window.names.join('-').replace(/[^\w-]+/g, '') : '';
   const outFile = OPT.out
     ? path.resolve(OPT.out)
-    : path.join(workDir, `${session.name}_${geom.outW}x${geom.outH}_${fps}fps${ext}`);
+    : path.join(workDir, `${session.name}${sceneTag}_${geom.outW}x${geom.outH}_${fps}fps${ext}`);
 
   let audioFile = null;
   if (!OPT.noAudio) {
@@ -204,6 +238,9 @@ function makeConfig(session, resKey, fps, overrides = {}) {
   return {
     input: url, project, adapter: project.adapter,
     workDir, resKey, fps, totalFrames, geom,
+    timeOffset, window,
+    angle: OPT.angle,
+    paintDeterminism: OPT.paintDeterminism,
     timeMode: overrides.timeMode ?? OPT.timeMode,
     freezeTimers: OPT.freezeTimers,
     seed: 0x2f6e2b1,
@@ -213,6 +250,7 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     quality, preset: OPT.preset, crf: OPT.crf, tenBit: OPT.tenBit,
     deband: OPT.deband, x264Params: OPT.x264,
     audioFile,
+    sceneTag,
     settleMs: OPT.settle, warmMs: OPT.warmMs, warmStride: OPT.warmStride,
     chunkFrames: 0,
     timeout: OPT.timeout, verify: OPT.verify, fresh: OPT.fresh,
@@ -240,6 +278,14 @@ function banner(session, cfg) {
     console.log(`  render    ${c.dim(`${cfg.geom.scaleMode} (dpr ${cfg.geom.dsf}` +
       `${cfg.geom.ss > 1 ? `, ss ${cfg.geom.ss}x` : ''}) · ${cfg.raster} raster · ` +
       `time=${cfg.timeMode} · ${cfg.jobs} worker(s)`)}`);
+    if (cfg.window) {
+      console.log(`  scenes    ${c.b(cfg.window.names.join(' + '))} ` +
+        c.dim(`${cfg.window.start.toFixed(1)}s – ${cfg.window.end.toFixed(1)}s`));
+    } else if (p.scenes && p.scenes.length) {
+      console.log(`  scenes    ${c.dim(`whole timeline (${p.scenes.length}: ` +
+        `${p.scenes.map((x) => x.name).join(', ').slice(0, 44)})`)}`);
+    }
+    if (cfg.angle) console.log(`  graphics  ${c.dim('ANGLE backend: ' + cfg.angle)}`);
     if (cfg.audioFile) console.log(`  audio     ${c.dim(path.basename(cfg.audioFile))}`);
   }
   console.log(c.dim('  ' + '-'.repeat(60)));
@@ -268,7 +314,7 @@ async function advancedMenu(cfg) {
   for (;;) {
     console.log('\n' + c.b('Advanced'));
     console.log(`   1) Quality profile   ${c.b(QUALITY_PROFILES[cfg.quality].label)}`);
-    console.log(`   2) Scale mode        ${c.b(cfg.geom.scaleMode)} ${c.dim('(dpr keeps glows radial)')}`);
+    console.log(`   2) Scale mode        ${c.b(cfg.geom.scaleMode)} ${c.dim('(dpr = stage never scales)')}`);
     console.log(`   3) Time handling     ${c.b(cfg.timeMode)} ${c.dim('(absolute fixes stutter)')}`);
     console.log(`   4) Supersampling     ${c.b(cfg.geom.ss > 1 ? `${cfg.geom.ss}x` : 'off')}`);
     console.log(`   5) Raster            ${c.b(cfg.raster)}`);
@@ -285,7 +331,7 @@ async function advancedMenu(cfg) {
       cfg.outFile = cfg.outFile.replace(/\.(mp4|mov)$/i, QUALITY_PROFILES[cfg.quality].ext);
     } else if (a === '2') {
       const i = await choose('Scale mode', [
-        { label: 'dpr',    note: 'raise device pixel ratio; correct blur/glow rasterisation' },
+        { label: 'dpr',    note: 'raise device pixel ratio; the stage renders at scale 1.0' },
         { label: 'layout', note: 'scale the stage with a CSS transform (legacy behaviour)' },
       ], cfg.geom.scaleMode === 'dpr' ? 0 : 1);
       cfg.geom = computeGeometry(cfg.project, {
@@ -322,12 +368,13 @@ async function advancedMenu(cfg) {
   }
 }
 
-async function mainMenu(session) {
+async function mainMenu(session, initialWindow = null) {
   let cfg = null;
+  let window = initialWindow;
   const ensureCfg = async () => {
     if (cfg) return cfg;
     const pick = await pickOutput(session.project);
-    cfg = makeConfig(session, pick.resKey, pick.fps);
+    cfg = makeConfig(session, pick.resKey, pick.fps, { window });
     return cfg;
   };
 
@@ -340,14 +387,33 @@ async function mainMenu(session) {
     console.log(`   ${c.b('4')}) ${c.cy('Diagnose quality')}        ${c.dim('stutter / soft text / boxy glow — start here')}`);
     console.log(`   ${c.b('5')}) Quick preview           ${c.dim('2s test clip to check settings fast')}`);
     console.log(`   ${c.b('6')}) Resolution / frame rate`);
-    console.log(`   ${c.b('7')}) Advanced settings`);
-    console.log(`   ${c.b('8')}) Quit`);
+    console.log(`   ${c.b('7')}) Choose scenes          ${c.dim(
+      window ? `currently: ${window.names.join(' + ')}` : 'currently: whole timeline')}`);
+    console.log(`   ${c.b('8')}) Advanced settings`);
+    console.log(`   ${c.b('9')}) Quit`);
 
-    const a = await ask('\n  Choose 1-8: ');
-    if (a === '8' || /^q/i.test(a)) return;
+    const a = await ask('\n  Choose 1-9: ');
+    if (a === '9' || /^q/i.test(a)) return;
 
-    if (a === '6') { const p = await pickOutput(session.project); cfg = makeConfig(session, p.resKey, p.fps); continue; }
-    if (a === '7') { await advancedMenu(await ensureCfg()); continue; }
+    if (a === '6') {
+      const p = await pickOutput(session.project);
+      cfg = makeConfig(session, p.resKey, p.fps, { window });
+      continue;
+    }
+
+    if (a === '7') {
+      const list = session.project.scenes || [];
+      if (!list.length) { console.log(c.y('\n  This composition does not declare scenes.')); continue; }
+      printScenes(list, { fps: cfg ? cfg.fps : 60 });
+      const v = await ask('\n  Scenes to render — name, number, range, or blank for all: ');
+      window = v.trim() ? resolveSelection(list, v) : null;
+      if (v.trim() && !window) console.log(c.r('  Nothing matched; keeping the previous selection.'));
+      else console.log(c.dim(window ? `  Selected ${window.names.join(' + ')}` : '  Whole timeline.'));
+      // The output size/length changed, so the config has to be rebuilt.
+      cfg = cfg ? makeConfig(session, cfg.resKey, cfg.fps, { window }) : null;
+      continue;
+    }
+    if (a === '8') { await advancedMenu(await ensureCfg()); continue; }
 
     if (a === '4') { await runDoctor(session, await ensureCfg()); continue; }
 
@@ -368,7 +434,7 @@ async function mainMenu(session) {
       await run(k, action);
       continue;
     }
-    console.log(c.r('  Please choose 1-8.'));
+    console.log(c.r('  Please choose 1-9.'));
   }
 }
 
@@ -376,15 +442,24 @@ async function mainMenu(session) {
 // Actions
 // ---------------------------------------------------------------------------
 
+const ACTIONS = ['render', 'fill', 'export', 'frames', 'doctor', 'preview'];
+
 async function run(cfg, action) {
+  // An unrecognised action must never fall through to "render everything at 4K":
+  // a typo should not silently start an hour of work.
+  if (!ACTIONS.includes(action)) {
+    throw new Error(`Unknown --action "${action}". Valid: ${ACTIONS.join(', ')}`);
+  }
   const t0 = Date.now();
   let res;
-  if (action === 'frames')      res = await render(cfg, { encode: false });
-  else if (action === 'export') res = await render(cfg, { encode: true, concurrent: false });
+  const sweep = !OPT.noSweep;
+  if (action === 'frames')      res = await render(cfg, { encode: false, sweep });
+  else if (action === 'export') res = await render(cfg, { encode: true, concurrent: false, sweep: false });
   else res = await render(cfg, {
     encode: true,
     concurrent: !OPT.noConcurrent,
     reap: OPT.reap,
+    sweep,
   });
   if (res.ok) console.log(c.dim(`\n  Total time ${fmtDuration((Date.now() - t0) / 1000)}`));
   return res;
@@ -404,7 +479,7 @@ async function renderPreview(session, base, seconds) {
   };
   fs.mkdirSync(cfg.workDir, { recursive: true });
   console.log(c.dim(`\n  Preview: ${count} frames starting at t=${startT.toFixed(2)}s`));
-  return render(cfg, { encode: true, concurrent: true, reap: true });
+  return render(cfg, { encode: true, concurrent: true, reap: true, sweep: false });
 }
 
 // ---------------------------------------------------------------------------
@@ -433,13 +508,41 @@ async function resolveSession() {
   }
 
   const resolved = resolveInput(inputPath);
+
+  // A Claude Code zip commonly holds several compositions. Pick deliberately
+  // rather than silently rendering whichever one scored highest.
+  const bundles = (resolved.bundles || []).filter((b) => b.looksLikeBundle);
+  let entryFile = resolved.entryFile;
+  if (OPT.entry) {
+    const want = OPT.entry.replace(/\\/g, '/').toLowerCase();
+    const hit = (resolved.bundles || []).find(
+      (b) => b.rel.toLowerCase() === want || b.rel.toLowerCase().endsWith('/' + want) ||
+             path.basename(b.rel).toLowerCase() === want);
+    if (!hit) {
+      throw new Error(`No bundle matching --entry "${OPT.entry}".\n  Available:\n   - ` +
+        (resolved.bundles || []).map((b) => b.rel).join('\n   - '));
+    }
+    entryFile = hit.fp;
+  } else if (bundles.length > 1) {
+    console.log(c.dim(`\n  This project contains ${bundles.length} separate compositions.`));
+    const i = await choose('Which one do you want to render?', bundles.slice(0, 9).map((b) => ({
+      label: b.rel,
+      note: b.durationHint
+        ? `${b.durationHint}s · ${b.scenes.length} scene(s): ${b.scenes.map((x) => x.name).join(', ').slice(0, 46)}`
+        : '',
+    })), 0);
+    entryFile = bundles[i].fp;
+  }
+
   const server = await startServer(resolved.rootDir);
-  const rel = path.relative(resolved.rootDir, resolved.entryFile).split(path.sep).join('/');
+  const rel = path.relative(resolved.rootDir, entryFile).split(path.sep).join('/');
   // ?__render=1 is what the Stage starter looks for; harmless for other bundles.
   const url = `${server.origin}/${encodeURI(rel)}?__render=1`;
 
   console.log(c.dim('\n  Reading the bundle...'));
-  const probe = await probeProject(url, { raster: OPT.raster, channel: OPT.channel, timeout: OPT.timeout });
+  const probe = await probeProject(url, {
+    raster: OPT.raster, channel: OPT.channel, angle: OPT.angle, timeout: OPT.timeout,
+  });
 
   const project = {
     ...probe,
@@ -468,13 +571,20 @@ async function resolveSession() {
     ? path.dirname(path.resolve(inputPath))
     : resolved.rootDir;
 
+  const baseName = resolved.fromZip
+    ? path.basename(inputPath).replace(/\.zip$/i, '')
+    : path.basename(resolved.rootDir);
+  // With several compositions in one project, the file name must say which.
+  const name = bundles.length > 1
+    ? `${baseName}_${path.basename(entryFile).replace(/\.html?$/i, '')}`
+    : (baseName || 'output');
+
   return {
-    project,
-    url,
+    project, url,
     rootDir: resolved.rootDir,
-    entryFile: resolved.entryFile,
+    entryFile,
     workDir,
-    name: path.basename(resolved.fromZip ? inputPath : resolved.rootDir).replace(/\.zip$/i, '') || 'output',
+    name,
     cleanup: async () => { await server.close(); resolved.cleanup(); },
   };
 }
@@ -489,15 +599,42 @@ async function resolveSession() {
 
   const session = await resolveSession();
   try {
+    const scenes = session.project.scenes || [];
+
+    if (OPT.listScenes) {
+      if (!scenes.length) console.log(c.y('\n  This composition does not declare a scene list.'));
+      else printScenes(scenes, { fps: OPT.fps || 60 });
+      console.log('');
+      return;
+    }
+
+    // A scene selection narrows every subsequent action to that slice.
+    let window = null;
+    if (OPT.scene) {
+      window = resolveSelection(scenes, OPT.scene);
+      if (!window) {
+        console.log(c.r(`\n  No scene matched "${OPT.scene}".`));
+        printScenes(scenes, { fps: OPT.fps || 60 });
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+      console.log(c.dim(`\n  Scene selection: ${window.names.join(' + ')} ` +
+        `(${window.start.toFixed(1)}s – ${window.end.toFixed(1)}s)`));
+      if (!window.contiguous) {
+        console.log(c.y('  Those scenes are not adjacent; everything between them is included.'));
+      }
+    }
+
     if (OPT.action) {
-      const cfg = makeConfig(session, OPT.res || '4k', OPT.fps || 60);
+      const cfg = makeConfig(session, OPT.res || '4k', OPT.fps || 60, { window });
       banner(session, cfg);
       if (OPT.action === 'doctor')  { await runDoctor(session, cfg); return; }
       if (OPT.action === 'preview') { await renderPreview(session, cfg, 2); return; }
       await run(cfg, OPT.action);
       return;
     }
-    await mainMenu(session);
+    await mainMenu(session, window);
     console.log('');
   } finally {
     await session.cleanup();

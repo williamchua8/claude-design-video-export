@@ -14,7 +14,8 @@
     "start": "node render.js",
     "doctor": "node render.js --action doctor",
     "setup": "playwright install chromium",
-    "selftest": "node test/selftest.js"
+    "selftest": "node test/selftest.js",
+    "sweeptest": "node test/sweep-test.js"
   },
   "dependencies": {
     "ffmpeg-static": "^5.2.0",

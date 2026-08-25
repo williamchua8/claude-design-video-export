@@ -38,88 +38,125 @@ under whichever one looks right.
 
 ---
 
-## The three problems this fixes
+## The problems this fixes
 
-### 1. Stutter and "visual lag" on some elements
+### 1. A section of the screen blinks for a moment
 
-**Cause.** A frame renderer seeks the composition to `t = i/fps` and screenshots.
-That is only correct for motion that is a pure function of the seek time.
-Anything driven by the **wall clock** — a CSS `@keyframes` ambient loop, a
-shimmer, a pulsing glow, a `requestAnimationFrame` ticker, a spring library, a
-`<video>` — keeps advancing on real time.
+**What it looks like.** Not a blank frame — for one frame, *part* of the
+composition fails to paint. In a real 4K/30 export from the previous script,
+frame 1362 lost the whole `HQ-Core` row and three KPI numbers, and drew a flat
+grey rectangle where they should have been. Frames 1361 and 1363 are both
+correct and identical to each other. At 30 fps that reads as a UI element
+blinking.
 
-During capture, real time does not advance at `1/fps`. Frame 0 takes 900 ms
-because the layer tree is cold, frame 1 takes 180 ms, frame 2 takes 240 ms, and a
-GC pause makes frame 3 take 700 ms. Every wall-clock-driven element therefore
-lurches forward by a different, random amount on every frame. Played back at a
-constant 60 fps, that is exactly what stutter looks like.
+**Cause.** A partial-paint race: the frame was serialised before that subtree
+finished rasterising.
 
-No bitrate fixes this. The frames themselves are inconsistent.
+**Fix, in two layers.**
 
-**Fix.** The renderer replaces every clock in the page before any page script
-runs — `performance.now`, `Date.now`, `Math.random`, `requestAnimationFrame` —
-with one virtual clock it steps to exactly `i/fps` per frame. It then pins every
-CSS animation, CSS transition and `<video>` to that same instant through the Web
-Animations API.
+*Compositor flags* (`lib/browser.js`, `--paint-determinism`) remove the async
+paint paths. They are **off by default**, and not for speed — they measured
+slightly faster. `--run-all-compositor-stages-before-draw` can deadlock the
+screenshot call outright: the compositor waits for a main-frame update that
+never arrives, because the virtual clock owns `requestAnimationFrame` and a
+pinned scene schedules no animation of its own. That showed up here as a 120 s
+screenshot timeout, which is a stalled render rather than a bad frame. Since the
+sweep below is the real guarantee, the trade was a stall risk against an
+unmeasured benefit, so they stay opt-in.
 
-The result is that **the same timestamp renders to byte-identical pixels every
-time**, no matter how long the machine took to get there. That is verified in
-`test/selftest.js`, including a check that two independent parallel workers
-produce the same frame (otherwise you get flicker at the seams between their
-ranges).
+*The dropout sweep* (`lib/sweep.js`) is the guarantee, and it runs by default.
+After capture it scans every frame for one specific signature:
 
-You do **not** need to rewrite your animation to make this work. Ambient CSS
-loops, rAF tickers and third-party animation libraries are all handled.
+```
+frame i differs a lot from i-1
+frame i differs a lot from i+1
+but i-1 and i+1 agree closely with each other     <- content left and came back
+```
+
+Under real motion, `i-1` and `i+1` are the *furthest* apart of the three pairs,
+never the closest, so ordinary animation cannot trigger it. Flagged frames are
+re-rendered, and the re-render is kept **only if it is measurably more
+consistent with its neighbours** — a frame that reproduces identically is
+authored content, so the original is put back untouched. Nothing loops, and
+nothing is silently changed.
+
+Validated against the real export: run over 50 frames of that video it found
+frame 1362 and nothing else — one true positive, zero false positives.
+
+Because dropouts are rare, the sweep is cheap: capture and encode still overlap,
+and a second encode pass happens only if a frame was actually repaired.
+
+### 2. Wall-clock motion (stutter on ambient elements)
+
+Frame-by-frame seeking is only correct for motion that is a pure function of the
+seek time. Anything on the **wall clock** — a CSS `@keyframes` loop, a shimmer, a
+`requestAnimationFrame` ticker, a `<video>` — keeps advancing on real time, and
+during capture real time does not advance at `1/fps`: one frame takes 900 ms
+because the layer tree is cold, the next 180 ms, then a GC pause costs 700 ms.
+Each such element lurches forward by a random amount every frame.
+
+Every clock in the page is replaced before any page script runs
+(`performance.now`, `Date.now`, `Math.random`, `requestAnimationFrame`) and
+stepped to exactly `i/fps`; every CSS animation, transition and media element is
+then pinned to that instant through the Web Animations API. The same timestamp
+renders to byte-identical pixels regardless of how long the machine took to get
+there — verified in `test/selftest.js`, including that two independent workers
+agree (otherwise you get flicker at the seams between their frame ranges).
+
+You do **not** need to re-author your animation for this.
 
 ```
 --time absolute   (default) pin every animation to the seek time
 --time replay     also step through the timeline, so an element that mounts
-                  mid-scene and transitions in starts its transition at the
-                  right moment
+                  mid-scene starts its transition at the right moment
 --time off        no virtual clock — reproduces the original stutter
 ```
 
-### 2. A radial glow that exports as a square
+### 3. A radial glow that exports as a rectangle
 
-There are two independent causes, and the doctor tells you which one you have.
+**Being straight with you: I could not reproduce this.** I rendered your actual
+bundle at 1080p, 1440p, 4K native and 4K supersampled, under GPU and software
+raster, and under both scale modes. Every one produced the same, correct, radial
+glow. I also tested the specific mechanism I suspected — Claude Design renders
+everything inside an SVG `<foreignObject>`, which is a known Chromium
+filter-clipping path — by re-parenting the live content into plain DOM and
+re-rendering. **Mean pixel difference: 0.** The foreignObject is not the cause.
 
-**Cause A — the headless shell.** Playwright and Puppeteer both ship two
-Chromium binaries. `chrome-headless-shell` is the small, cut-down one, and it
-mis-composites `filter: blur()` and `backdrop-filter` when they sit under a
-transform, clipping them to the element's rectangular layer bounds. Puppeteer's
-`headless: true` and the deprecated `headless: 'new'` do not reliably get you the
-full build across versions — which is how a script can work for months and then
-start producing square glows after a routine dependency bump.
+That points at your graphics driver. The test machine here is Linux on
+SwiftShader; you are on Windows with AMD graphics, and the previous script
+hardcoded `--use-angle=d3d11`. A large-sigma blur mis-rasterising is exactly the
+kind of thing that is driver-specific — and it would explain why supersampling
+and the software/GPU toggle made no difference for you, since neither changes
+the ANGLE backend.
 
-This renderer explicitly requests a full Chromium, then **verifies what it
-actually got** and warns loudly if it landed on the shell.
+So rather than ship a fix for a cause I could not confirm, the tool gives you the
+means to identify it on your own machine:
 
-**Cause B — scaling the stage instead of the device.** There are two ways to
-render a 1920×1080 composition at 4K, and they are not equivalent:
+```bash
+node render.js --input project.zip --action doctor
+```
 
-- **`--scale-mode dpr`** (default). The viewport stays at the authored size and
-  `deviceScaleFactor` goes to 2. The stage lays out at scale 1.0 and Chromium
-  rasterises the whole page at 2× density — blur radii, radial gradients, shadows
-  and text all computed at full output resolution, exactly as on a retina
-  display.
-- **`--scale-mode layout`**. The viewport is set to 3840 px and the stage scales
-  *itself* up 2× with a CSS transform. Fine for a flat rectangle. Not fine for a
-  `filter: blur(140px)` glow inside a `preserve-3d` subtree: the raster scale gets
-  clamped, the blur is computed on a smaller surface and then magnified, and a
-  soft radial falloff degrades into visible steps or a flat box.
+The doctor renders **the same instant under five render paths** that differ only
+in how the page is rasterised, including `--angle swiftshader`, which uses
+ANGLE's own CPU rasteriser and involves no vendor driver at all. It then compares
+them **against each other**.
 
-Most hand-rolled export scripts do the second one. This one defaults to the
-first.
+That comparison is the whole point. An absolute "is this glow round" measurement
+is worthless here and the tool no longer pretends otherwise — a rectangular panel
+legitimately has a rectangular halo, so a high anisotropy number can be perfectly
+correct. But identical content through different graphics paths must look
+identical. Where two disagree, one is wrong.
 
-**How the measurement works.** A true radial glow fades out at the same distance
-in every direction. A glow clipped to its box reaches √2 further into the corners
-than along the axes. The doctor reports that ratio — **~1.0 is radial, ~1.41 is
-clipped**. The measurement is validated in the test suite against a fixture
-holding two identical glows, one of them deliberately inside `overflow: hidden`
-(it measures 1.00 and 1.38 respectively), so a "radial (correct)" verdict means
-something.
+If `D-angle-swiftshader` is the one that looks right, it is your driver, and
+`--angle swiftshader` renders correctly at some cost in speed:
 
-### 3. Slow, wasteful exporting
+```bash
+node render.js --input project.zip --res 4k --angle swiftshader
+```
+
+Backends available: `default`, `d3d11`, `d3d9`, `gl`, `vulkan`, `swiftshader`.
+
+### 4. Slow, wasteful exporting
 
 - **Capture and encode run at the same time.** A feeder walks the frames in order
   and pushes them into a long-lived ffmpeg on stdin, so the mp4 finishes seconds
@@ -172,6 +209,47 @@ creating a text-softness problem it does. Available as `--deband` if you need it
 
 ---
 
+## Rendering part of a project
+
+A Claude Design piece is one continuous timeline made of named sections, and a
+`.zip` from Claude Code often holds several separate compositions. You rarely
+want all of it.
+
+**Several videos in one zip.** Every bundle in the project is detected and you
+are asked which one to render (or pass `--entry`). The chosen one's name goes
+into the output filename so exports do not collide.
+
+**Sections within one video.** The composition declares its own scene list, which
+the tool reads straight out of the bundle:
+
+```bash
+node render.js --input project.zip --list-scenes
+```
+
+```
+   1) Silos        0.0s – 5.0s   (5s, 150 frames)
+        Five vendor devices drop in above a dark campus grid…
+   2) Unify        5.0s – 11.0s  (6s, 180 frames)
+   3) OnePane     11.0s – 20.0s  (9s, 270 frames)
+   4) MultiSite   20.0s – 32.0s  (12s, 360 frames)
+   5) IPAM        32.0s – 47.0s  (15s, 450 frames)
+   6) Close       47.0s – 52.0s  (5s, 150 frames)
+   total 52s
+```
+
+Then render only what you need — by name, number, range or list:
+
+```bash
+node render.js --input project.zip --scene IPAM
+node render.js --input project.zip --scene 3
+node render.js --input project.zip --scene 2-4
+node render.js --input project.zip --scene "ipam,close"
+```
+
+Re-cutting one 15-second scene renders 450 frames instead of 1560. Frames for a
+scene are cached under their own key, so they are never confused with a full
+render sitting in the same project.
+
 ## Common recipes
 
 ```bash
@@ -195,6 +273,12 @@ node render.js --input project.zip --quality prores --audio voiceover.mp3
 
 # Resume an interrupted render
 node render.js --input project.zip --action fill
+
+# One scene only, from a project containing several videos
+node render.js --input project.zip --entry scene-2/index.html --scene IPAM
+
+# A glow renders wrongly on this machine but not elsewhere
+node render.js --input project.zip --res 4k --angle swiftshader
 ```
 
 Run `node render.js --help` for the full flag list.
@@ -207,6 +291,17 @@ Run `node render.js --help` for the full flag list.
 `chrome-headless-shell`, run `npx playwright install chromium`. If it reports the
 full build and variant **A** still looks wrong while **C** (software raster)
 looks right, use `--software`.
+
+**"An element blinks for a moment."** That is the paint dropout described above,
+and the sweep catches it automatically. If you disabled it with `--no-sweep`, turn
+it back on. If it persists, `--jobs 1` reduces compositor pressure.
+
+**"Capture is slower than I expected."** A composition authored at 4K lays out at
+3840 css px whatever resolution you export, so layout cost is the same at 1080p
+as at 4K — only rasterisation gets cheaper. Throughput is dominated by your GPU
+and core count. Use `--action preview` to time a short slice before committing to
+the whole timeline, and `--scene` to avoid re-rendering parts you have not
+changed.
 
 **"Some elements still jitter."** The doctor's determinism check will say whether
 frames are still non-reproducible with the virtual clock on. If they are,
@@ -238,9 +333,11 @@ Either export at native size or add `--ss 2`.
 | `lib/frames.js` | Atomic writes and structural PNG validation (resume) |
 | `lib/encode.js` | ffmpeg filter chain and encoder settings |
 | `lib/pipeline.js` | Runs capture and encode concurrently |
+| `lib/scenes.js` | Reads the composition's scene list; resolves `--scene` |
+| `lib/sweep.js` | Paint-dropout detection and repair |
 | `lib/pixels.js` | Glow measurement |
 | `lib/doctor.js` | The diagnostic suite |
-| `test/selftest.js` | 12 end-to-end checks against deliberately broken fixtures |
+| `test/selftest.js` | End-to-end checks against deliberately broken fixtures |
 
 ```bash
 npm run selftest
