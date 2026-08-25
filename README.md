@@ -102,18 +102,65 @@ neither boundary got worse. A run that reproduces identically is authored
 content, so the original is put back untouched. Nothing loops, and nothing is
 silently changed.
 
+**A second detector, because one signature is not enough.** The run test asks
+whether the frames *bracketing* a run agree with each other. During a hold that
+is exactly right and beautifully specific. During a **transition it can never
+fire**: in a cross-fade the frame before and the frame after a dropout are at
+different points in the fade, so they never agree, and a panel that vanishes
+mid-fade sails straight through. That is a structural blind spot, not a
+threshold that needs nudging — `test/sweep-test.js` asserts the miss explicitly.
+
+So there is a second test for exactly that case. For smooth change of any kind,
+frame *i* sits close to the straight line between *i-1* and *i+1*:
+
+```
+residual(i) = mean | frame[i] - (frame[i-1] + frame[i+1]) / 2 |
+```
+
+Compare that against how non-linear this stretch of timeline normally is — the
+*median* residual of nearby frames, excluding *i* and its immediate neighbours
+so a dropout cannot raise its own baseline. Smooth motion, however fast, scores
+near its own baseline. A frame that lost content spikes far above it.
+
+**Re-rendering is the arbiter, not the detector.** The second test is
+deliberately looser, and that is a design choice: a candidate costs one
+re-render, and authored content reproduces identically and is put back. So the
+detector only has to be a cheap filter, and the verification decides. On real
+footage it flags about 1% of frames, nearly all of them authored fast cuts,
+which are then correctly rejected. A repair is accepted when the frame **stops
+being an outlier** — the same measure for both detectors, so neither can talk
+the sweep into keeping a change that did not help.
+
 **Validated against real footage.** Across two 1560-frame 4K exports of the same
-project it finds the two-frame dropout at 1357–1358 in one, the single-frame
-dropouts at 1167 and 1362 in the other, and **nothing else in 3120 frames**.
-`test/sweep-test.js` holds the synthetic contract tests, including that fast
-linear motion, scene cuts, slow fades and incoherent excursions all stay unflagged.
+project the run test finds the two-frame dropout at 1357–1358 in one, the
+single-frame dropouts at 1167 and 1362 in the other, and **nothing else in 3120
+frames**. `test/sweep-test.js` holds the synthetic contract tests: fast linear
+motion, scene cuts, slow fades, hard-cut edges and incoherent excursions all
+stay unflagged, and the fade-dropout case is covered end to end.
 
 Because dropouts are rare, the sweep is cheap: capture and encode still overlap,
 and a second encode pass happens only if a frame was actually repaired.
 
 ```
---sweep-max-run <n>   longest dropout to look for (default 4 frames)
---no-sweep            skip the check entirely
+--sweep-max-run <n>              longest dropout to look for (default 4 frames)
+--sweep-sensitivity low|normal|high
+                                 how eagerly to suspect a frame during a
+                                 transition. Try "high" if a blink survives a
+                                 normal sweep; each extra candidate costs one
+                                 re-render and authored content is kept
+--no-transition-sweep            holds only; skip the transition pass
+--no-sweep                       skip the check entirely
+```
+
+**When you can see it and the sweep cannot.** Detectors are heuristics and will
+occasionally miss something you spot instantly. `--redo` re-renders exactly what
+you name and re-encodes, without anyone deleting PNGs by hand:
+
+```bash
+node render.js --input index.html --redo 1440           # one frame
+node render.js --input index.html --redo 1438-1442      # a range of frames
+node render.js --input index.html --redo 48s            # by timestamp
+node render.js --input index.html --redo 47.9s-48.1s    # a time range
 ```
 
 ### 2. Wall-clock motion (stutter on ambient elements)
@@ -423,8 +470,19 @@ looks right, use `--software`.
 
 **"An element blinks for a moment."** That is the paint dropout described above,
 and the sweep catches it automatically. If you disabled it with `--no-sweep`, turn
-it back on. If a blink is longer than four frames, raise `--sweep-max-run`. If it
-persists, `--jobs 1` reduces compositor pressure.
+it back on. If a blink is longer than four frames, raise `--sweep-max-run`.
+
+If one survives a normal sweep — most likely during a fade or a transition,
+where a dropout is hardest to identify — escalate in this order:
+
+```bash
+node render.js --input index.html --sweep-sensitivity high   # suspect more
+node render.js --input index.html --redo 47.9s-48.1s         # or just name it
+```
+
+`--redo` is the direct route: it re-renders those frames whatever the detectors
+think, then re-encodes. `--jobs 1` also reduces compositor pressure, which makes
+the underlying race less likely in the first place.
 
 **"I rendered a second video and got the first one again."** Fixed — frame
 folders are now per-composition (section 5 above). If you are on an older copy,

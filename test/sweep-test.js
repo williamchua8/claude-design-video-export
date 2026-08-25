@@ -8,7 +8,7 @@
 // dropouts (a two-frame one in the first, two single-frame ones in the second)
 // and nothing else in 3120 frames.
 
-import { detectDropouts } from '../lib/sweep.js';
+import { detectDropouts, detectOutliers, detectCandidates } from '../lib/sweep.js';
 import { c } from '../lib/util.js';
 
 const W = 32, H = 18, FB = W * H;
@@ -123,6 +123,81 @@ console.log(c.b('\n  Dropout detector\n'));
   const hits = detectDropouts(makeSig(frames));
   check('a slow fade is NOT flagged', hits.length === 0,
     `hits=${JSON.stringify(hits.map((x) => x.index))}`);
+}
+
+// ---------------------------------------------------------------------------
+// The transition-aware detector
+// ---------------------------------------------------------------------------
+//
+// The run test asks whether the frames bracketing a dropout agree with each
+// other. During a cross-fade they never do, so a dropout mid-fade is invisible
+// to it. These cases pin down the second detector that covers exactly that.
+
+console.log(c.b('\n  Transition-aware detector\n'));
+
+// A fast cross-fade carrying a small bright panel. The fade step is large
+// relative to the panel, which is what real footage looks like -- and what
+// makes the bracketing frames disagree, blinding the run test.
+const LEVEL = (i) => 10 + i * 20;
+const fading = (i, gone) => (x, y) => ((!gone && y >= 8 && y < 10) ? 220 : LEVEL(i));
+
+// A panel that vanishes for two frames in the MIDDLE of a fast fade.
+{
+  const frames = [];
+  for (let i = 0; i < 11; i++) frames.push(fading(i, i === 5 || i === 6));
+  const sig = makeSig(frames);
+
+  check('a dropout during a fade is invisible to the run test (this is the gap)',
+    detectDropouts(sig).length === 0,
+    'the bracketing frames are at different fade levels, so they never agree');
+
+  const hits = detectOutliers(sig).map((h) => h.index);
+  check('the transition detector DOES catch it',
+    hits.includes(5) && hits.includes(6), `hits=${JSON.stringify(hits)}`);
+
+  const runs = detectCandidates(sig).runs;
+  const covered = runs.some((r) => r.frames.includes(5)) && runs.some((r) => r.frames.includes(6));
+  check('and the merged candidate list covers both frames', covered,
+    JSON.stringify(runs.map((r) => [r.start, r.len, r.source])));
+}
+
+// A clean fade with nothing wrong in it must stay silent, however long.
+{
+  const frames = [];
+  for (let i = 0; i < 12; i++) frames.push(fading(i, false));
+  const hits = detectOutliers(makeSig(frames));
+  check('a clean fade is NOT flagged', hits.length === 0,
+    `hits=${JSON.stringify(hits.map((h) => h.index))}`);
+}
+
+// Steady fast motion is far from linear frame to frame, but it is CONSISTENTLY
+// far, so the local baseline absorbs it.
+{
+  const frames = [];
+  for (let i = 0; i < 40; i++) frames.push((x, y) => (x > (i * 5) % 32 && x < ((i * 5) % 32) + 6 ? 230 : 15));
+  const hits = detectOutliers(makeSig(frames));
+  check('sustained fast motion is NOT flagged', hits.length === 0,
+    `hits=${JSON.stringify(hits.map((h) => h.index))}`);
+}
+
+// The first frame after a hard cut is maximally non-linear, but it agrees with
+// the frame after it, which is what tells the two apart.
+{
+  const a = () => 30, b = () => 210;
+  const hits = detectOutliers(makeSig([a, a, a, a, b, b, b, b]));
+  check('the frame after a hard cut is NOT flagged', hits.length === 0,
+    `hits=${JSON.stringify(hits.map((h) => h.index))}`);
+}
+
+// Turning the outlier detector off must leave the run test exactly as it was.
+{
+  const normal = (x, y) => (y > 4 && y < 12 ? 200 : 20);
+  const dropped = (x, y) => (y > 8 && y < 12 ? 200 : 20);
+  const sig = makeSig([normal, normal, dropped, dropped, normal, normal]);
+  const runs = detectCandidates(sig, { outliers: false }).runs;
+  check('with the outlier pass off, the run test still stands alone',
+    runs.length === 1 && runs[0].start === 2 && runs[0].len === 2,
+    JSON.stringify(runs.map((r) => [r.start, r.len])));
 }
 
 console.log(`\n  ${failures ? c.r(`${failures} failed`) : c.g('all passed')}\n`);

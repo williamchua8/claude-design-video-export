@@ -27,7 +27,7 @@ import { projectKey, bundleNames, fileHash, framesDir } from './lib/workspace.js
 import { QUALITY_PROFILES, ffmpegBin, findAudio } from './lib/encode.js';
 import { runDoctor } from './lib/doctor.js';
 import { ANGLE_BACKENDS } from './lib/browser.js';
-import { c, fmtDuration, clamp, even } from './lib/util.js';
+import { c, fmtDuration, clamp, even, parseFrameSelection } from './lib/util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +77,9 @@ const OPT = {
   listScenes: has('--list-scenes'),
   noSweep:   has('--no-sweep'),
   sweepMaxRun: Math.max(1, parseInt(val('--sweep-max-run', '4'), 10) || 4),
+  sweepSensitivity: val('--sweep-sensitivity', 'normal'),
+  noOutliers: has('--no-transition-sweep'),
+  redo:      val('--redo', null),
   paintDeterminism: has('--paint-determinism'),
   quality:   val('--quality', 'master'),
   preset:    val('--preset', 'slow'),
@@ -155,6 +158,22 @@ ${c.b('Quality / correctness')}
                             what stops sections of the UI blinking)
   --sweep-max-run <n>       longest dropout to look for, in frames (default 4).
                             Real ones observed so far are 1-2 frames long.
+  --sweep-sensitivity low|normal|high
+                            how eagerly to suspect a frame DURING A TRANSITION,
+                            where a dropout cannot be identified as cleanly as
+                            during a hold. Higher flags more candidates; each
+                            one costs a re-render, and anything the composition
+                            meant to do reproduces and is kept. Try "high" if a
+                            blink survives a normal sweep. Default normal
+                            (~1% of frames re-rendered on real footage).
+  --no-transition-sweep     only look for dropouts during holds (the original,
+                            very specific test) and skip the transition pass
+  --redo <sel>              re-render these frames whatever the detectors think,
+                            then re-encode. For when you can SEE the bad frame:
+                              --redo 1440          one frame
+                              --redo 1438-1442     a range
+                              --redo 48s           by timestamp
+                              --redo 47.9s-48.1s   a time range
   --paint-determinism       extra compositor flags that force paint to finish
                             before capture. Off by default: they can deadlock
                             the screenshot call, and the dropout sweep already
@@ -285,6 +304,9 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     channel: OPT.channel,
     jobs: overrides.jobs ?? OPT.jobs ?? autoJobs(resKey),
     sweepMaxRun: OPT.sweepMaxRun,
+    sweepSensitivity: OPT.sweepSensitivity,
+    sweepOutliers: !OPT.noOutliers,
+    redo: OPT.redo ? parseFrameSelection(OPT.redo, fps, totalFrames) : null,
     quality, preset: OPT.preset, crf: OPT.crf, tenBit: OPT.tenBit,
     deband: OPT.deband, x264Params: OPT.x264,
     audioFile,
