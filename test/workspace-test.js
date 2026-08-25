@@ -10,10 +10,32 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { projectKey, bundleNames, framesDir, acquireLock, readLock, LOCK_STALE_MS } from '../lib/workspace.js';
+import { DiskSink } from '../lib/frames.js';
+import { parseFrameSelection } from '../lib/util.js';
 import { resolveQueue } from '../lib/queue.js';
 import { legacyFramesDir, adoptLegacyFrames } from '../lib/pipeline.js';
 import { c } from '../lib/util.js';
+
+/** A tiny but structurally real PNG, so DiskSink's validity checks pass. */
+function makeTestPng(w = 8, h = 8) {
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(body) >>> 0);
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const raw = Buffer.alloc(h * (1 + w * 3));            // filter byte 0 + RGB per row
+  // level 0 so the file comfortably clears DiskSink's truncation floor
+  // instead of deflating an all-zero image down to a handful of bytes.
+  const idat = zlib.deflateSync(raw, { level: 0 });
+  return Buffer.concat([sig, chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))]);
+}
 
 let failures = 0;
 const check = (name, pass, detail) => {
@@ -131,6 +153,59 @@ console.log(c.b('\n  Workspace: frame folders, locks, queue\n'));
   const r = adoptLegacyFrames(cfg);
   check('ambiguous legacy frames are left untouched',
     r && !r.moved && fs.existsSync(path.join(old, 'frame_000000.png')), r && r.why);
+}
+
+// ---- scene frame numbering -----------------------------------------------
+//
+// Rendering only one scene must not restart frame numbering at 0. The whole
+// point is that the frames a scene writes land at the exact filename they
+// would have in a full render of the video, so a scene rendered on a second
+// machine can be dropped straight into the same frames folder as everything
+// else -- no renaming, no bookkeeping about which scene is which.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdv-offset-'));
+  const OFFSET = 960;                      // e.g. a scene starting at t=32s, 30fps
+  const sink = new DiskSink(dir, 8, 8, OFFSET);
+  const pngA = makeTestPng(), pngB = makeTestPng();
+
+  sink.write(0, pngA);
+  sink.write(1, pngB);
+
+  check('a scene\'s first frame is filed under the FULL VIDEO\'s frame number',
+    fs.existsSync(path.join(dir, 'frame_000960.png')),
+    fs.readdirSync(dir).join(','));
+  check('the render still sees it at its own local index 0',
+    sink.has(0) && sink.take(0).equals(pngA));
+  check('nothing is written at local index 0\'s literal filename',
+    !fs.existsSync(path.join(dir, 'frame_000000.png')));
+
+  check('missing() still reports LOCAL gaps, not global ones',
+    JSON.stringify(sink.missing(4)) === JSON.stringify([2, 3]),
+    JSON.stringify(sink.missing(4)));
+
+  // sizeConflicts() reads filenames straight off disk (already global) and
+  // must not run them through the offset a second time.
+  check('sizeConflicts reads its own frame back without double-applying the offset',
+    sink.sizeConflicts() === null);
+
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+}
+
+{
+  // --redo takes frame numbers and timestamps against the FULL VIDEO -- the
+  // same numbers printed everywhere else and baked into the filenames above --
+  // not against the scene's own local position.
+  const fps = 30, offset = 960, total = 450;   // a 15s scene, 32s-47s of the video
+  check('--redo by GLOBAL frame number lands on the right LOCAL index',
+    JSON.stringify(parseFrameSelection('1000', fps, total, offset)) === JSON.stringify([40]));
+  check('--redo by absolute timestamp also lands on the right LOCAL index',
+    JSON.stringify(parseFrameSelection('33s', fps, total, offset)) === JSON.stringify([30]));
+  check('a timestamp before this scene starts yields nothing',
+    parseFrameSelection('10s', fps, total, offset).length === 0);
+  check('a timestamp after this scene ends yields nothing',
+    parseFrameSelection('50s', fps, total, offset).length === 0);
+  check('a whole-video render (offset 0) is unaffected',
+    JSON.stringify(parseFrameSelection('48s', fps, 1560, 0)) === JSON.stringify([1440]));
 }
 
 // ---- queue selection ----------------------------------------------------------

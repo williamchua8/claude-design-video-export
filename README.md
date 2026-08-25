@@ -420,6 +420,38 @@ Re-cutting one 15-second scene renders 450 frames instead of 1560. Frames for a
 scene are cached under their own key, so they are never confused with a full
 render sitting in the same project.
 
+**Frame numbers match the FULL VIDEO, not the scene.** Rendering just IPAM
+(32.0s-47.0s of a 30fps video) does not write `frame_000000.png` onward — it
+writes `frame_000960.png` onward, exactly where those frames sit in a full
+render's numbering:
+
+```bash
+node render.js --input project.zip --scene IPAM --res 4k --fps 30
+```
+
+```
+  scenes    IPAM 32.0s – 47.0s  (frames 960-1409 of the full video)
+```
+
+That is what makes it possible to split a render across machines. Send one
+scene to a second, faster device — maybe one without the raster bug your main
+machine has — and its output drops straight into the same `frames/` folder as
+the rest of the video with no renaming, because there is only one number for
+"frame 1200" and both machines agree on it:
+
+```bash
+# on the fast machine
+node render.js --input project.zip --scene IPAM --res 4k --fps 30 --action frames
+
+# copy frames/<project>/3840x2160@30_IPAM/*.png into the same slot on the
+# machine doing the full render, then finish it there
+node render.js --input project.zip --res 4k --fps 30 --action fill
+```
+
+Every message that names a frame — "already on disk", a capture failure, a
+dropout report, `--redo` — uses this same full-video numbering, so what you see
+in the log is always the filename on disk.
+
 ## Common recipes
 
 ```bash
@@ -515,6 +547,14 @@ duplicating frames. Render at a rate it actually hits.
 Either export at native size or add `--ss 2`.
 
 **"It runs out of disk."** Add `--reap`.
+
+**"I rendered a scene before this fix and now it wants to re-render everything."**
+Frame numbering for scene renders changed to match the full video (see
+"Rendering part of a project" above) — a scene folder's frames used to start at
+`frame_000000.png` and now start at wherever that scene sits in the full
+timeline. Frames rendered under the old numbering are not recognised under the
+new one, so the folder looks empty. This is a one-time cost per scene; delete
+the old scene's frame folder or just let it re-render.
 
 ---
 

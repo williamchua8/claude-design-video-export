@@ -169,7 +169,11 @@ ${c.b('Quality / correctness')}
   --no-transition-sweep     only look for dropouts during holds (the original,
                             very specific test) and skip the transition pass
   --redo <sel>              re-render these frames whatever the detectors think,
-                            then re-encode. For when you can SEE the bad frame:
+                            then re-encode. For when you can SEE the bad frame.
+                            Frame numbers and timestamps are against the FULL
+                            video, same as what is printed everywhere else --
+                            when rendering just one scene, --redo 48s still
+                            means t=48s of the whole video, not of the scene:
                               --redo 1440          one frame
                               --redo 1438-1442     a range
                               --redo 48s           by timestamp
@@ -270,6 +274,11 @@ function makeConfig(session, resKey, fps, overrides = {}) {
   const timeOffset = window ? window.start : 0;
   const duration = window ? (window.end - window.start) : project.duration;
   const totalFrames = Math.max(1, Math.round(duration * fps));
+  // The on-disk frame number a scene render starts at, so its files land at
+  // their real position in the full video's numbering rather than at 0. That
+  // is what lets a scene rendered on a second machine drop straight into the
+  // main frame folder next to everything else -- see DiskSink in lib/frames.js.
+  const frameOffset = window ? Math.round(window.start * fps) : 0;
   const quality = overrides.quality ?? OPT.quality;
   const ext = (QUALITY_PROFILES[quality] || QUALITY_PROFILES.master).ext;
 
@@ -294,7 +303,7 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     entryRel: session.entryRel,
     entryHash: session.entryHash,
     bundleCount: session.bundleCount || 1,
-    timeOffset, window,
+    timeOffset, window, frameOffset,
     angle: OPT.angle,
     paintDeterminism: OPT.paintDeterminism,
     timeMode: overrides.timeMode ?? OPT.timeMode,
@@ -306,7 +315,7 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     sweepMaxRun: OPT.sweepMaxRun,
     sweepSensitivity: OPT.sweepSensitivity,
     sweepOutliers: !OPT.noOutliers,
-    redo: OPT.redo ? parseFrameSelection(OPT.redo, fps, totalFrames) : null,
+    redo: OPT.redo ? parseFrameSelection(OPT.redo, fps, totalFrames, frameOffset) : null,
     quality, preset: OPT.preset, crf: OPT.crf, tenBit: OPT.tenBit,
     deband: OPT.deband, x264Params: OPT.x264,
     audioFile,
@@ -340,7 +349,8 @@ function banner(session, cfg) {
       `time=${cfg.timeMode} · ${cfg.jobs} worker(s)`)}`);
     if (cfg.window) {
       console.log(`  scenes    ${c.b(cfg.window.names.join(' + '))} ` +
-        c.dim(`${cfg.window.start.toFixed(1)}s – ${cfg.window.end.toFixed(1)}s`));
+        c.dim(`${cfg.window.start.toFixed(1)}s – ${cfg.window.end.toFixed(1)}s  ` +
+          `(frames ${cfg.frameOffset}-${cfg.frameOffset + cfg.totalFrames - 1} of the full video)`));
     } else if (p.scenes && p.scenes.length) {
       console.log(`  scenes    ${c.dim(`whole timeline (${p.scenes.length}: ` +
         `${p.scenes.map((x) => x.name).join(', ').slice(0, 44)})`)}`);
@@ -571,6 +581,10 @@ async function renderPreview(session, base, seconds) {
     ...base,
     totalFrames: count,
     timeOffset: startT,
+    // A preview is a scratch clip in its own folder; its frame numbering only
+    // needs to be internally consistent with where it actually starts, not
+    // with whatever scene window `base` came from.
+    frameOffset: Math.round(startT * base.fps),
     workDir: path.join(base.workDir, '.cdv-preview'),
     outFile: base.outFile.replace(/(\.\w+)$/, '_preview$1'),
   };
