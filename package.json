@@ -1,6 +1,6 @@
 {
   "name": "claude-design-video",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Render Claude Design animation bundles to high-quality MP4 — deterministic frames, correct blur/glow compositing, concurrent encoding.",
@@ -15,7 +15,10 @@
     "doctor": "node render.js --action doctor",
     "setup": "playwright install chromium",
     "selftest": "node test/selftest.js",
-    "sweeptest": "node test/sweep-test.js"
+    "sweeptest": "node test/sweep-test.js",
+    "workspacetest": "node test/workspace-test.js",
+    "test": "node test/sweep-test.js && node test/workspace-test.js && node test/selftest.js",
+    "queue": "node render.js --all"
   },
   "dependencies": {
     "ffmpeg-static": "^5.2.0",

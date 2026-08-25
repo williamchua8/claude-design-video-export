@@ -21,7 +21,9 @@ import { resolveInput, autoDetect, startServer } from './lib/input.js';
 import { withTimes, resolveSelection, printScenes, scenesTotal } from './lib/scenes.js';
 import { probeProject } from './lib/probe.js';
 import { computeGeometry } from './lib/capture.js';
-import { render, framesDirFor } from './lib/pipeline.js';
+import { render } from './lib/pipeline.js';
+import { resolveQueue, printBundles, runQueue } from './lib/queue.js';
+import { projectKey, bundleNames, fileHash, framesDir } from './lib/workspace.js';
 import { QUALITY_PROFILES, ffmpegBin, findAudio } from './lib/encode.js';
 import { runDoctor } from './lib/doctor.js';
 import { ANGLE_BACKENDS } from './lib/browser.js';
@@ -68,9 +70,13 @@ const OPT = {
   channel:   val('--channel', null),
   angle:     val('--angle', null),         // default|d3d11|d3d9|gl|vulkan|swiftshader
   entry:     val('--entry', null),         // which bundle inside a zip/folder
+  queue:     val('--queue', null),         // render several bundles back to back
+  all:       has('--all'),                 // shorthand for --queue all
+  listEntries: has('--list-entries'),
   scene:     val('--scene', null),         // "IPAM" | "3" | "2-4" | "ipam,close"
   listScenes: has('--list-scenes'),
   noSweep:   has('--no-sweep'),
+  sweepMaxRun: Math.max(1, parseInt(val('--sweep-max-run', '4'), 10) || 4),
   paintDeterminism: has('--paint-determinism'),
   quality:   val('--quality', 'master'),
   preset:    val('--preset', 'slow'),
@@ -112,6 +118,15 @@ ${c.b('Output')}
 ${c.b('Choosing what to render')}
   --entry <rel path>        which bundle inside a folder/zip (a Claude Code zip
                             often holds several videos). Omit to be asked.
+  --list-entries            print the compositions in the project and exit
+  --all                     queue and render EVERY composition in the project
+  --queue <sel>             queue some of them, then render each in turn.
+                            Same grammar as --scene:
+                              --queue all       --queue 1,3
+                              --queue 2-4       --queue "intro,outro"
+                            Each one gets its own frame folder and its own
+                            output file; a failure is recorded and the queue
+                            carries on.
   --list-scenes             print the composition's scenes and exit
   --scene <sel>             render only part of the timeline. Accepts a scene
                             name, a 1-based number, a range or a list:
@@ -136,8 +151,10 @@ ${c.b('Quality / correctness')}
                             If a glow renders as a rectangle on your machine but
                             looks right elsewhere, try --angle swiftshader: it
                             bypasses the GPU driver entirely.
-  --no-sweep                skip the one-frame paint-dropout check (on by
-                            default; it is what stops elements blinking)
+  --no-sweep                skip the paint-dropout check (on by default; it is
+                            what stops sections of the UI blinking)
+  --sweep-max-run <n>       longest dropout to look for, in frames (default 4).
+                            Real ones observed so far are 1-2 frames long.
   --paint-determinism       extra compositor flags that force paint to finish
                             before capture. Off by default: they can deadlock
                             the screenshot call, and the dropout sweep already
@@ -164,9 +181,22 @@ ${c.b('Actions')}
 // ---------------------------------------------------------------------------
 
 let rl = null;
-const openPrompt = () => (rl ??= readline.createInterface({ input: process.stdin, output: process.stdout }));
+// True once stdin has ended. Piped or redirected input delivers everything in
+// one chunk, so readline reaches EOF after the first question and every prompt
+// after it would throw ERR_USE_AFTER_CLOSE. Rather than crash halfway through a
+// menu, prompts from that point on answer with their default and the menus quit.
+let stdinDone = false;
+const openPrompt = () => {
+  if (!rl) {
+    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('close', () => { stdinDone = true; });
+  }
+  return rl;
+};
 const closePrompt = () => { if (rl) { rl.close(); rl = null; } };
-const ask = (q) => new Promise((r) => openPrompt().question(q, (a) => r(a.trim())));
+const ask = (q) => (stdinDone
+  ? Promise.resolve('')
+  : new Promise((r) => openPrompt().question(q, (a) => r(a.trim()))));
 
 async function choose(title, items, defaultIdx = 0) {
   console.log('\n' + c.b(title));
@@ -177,6 +207,7 @@ async function choose(title, items, defaultIdx = 0) {
   for (;;) {
     const a = await ask(`\n  Choose 1-${items.length} ${c.dim(`[Enter = ${defaultIdx + 1}]`)}: `);
     if (a === '') return defaultIdx;
+    if (stdinDone) return defaultIdx;
     const n = parseInt(a, 10);
     if (n >= 1 && n <= items.length) return n - 1;
     console.log(c.r('  Please enter a number from the list.'));
@@ -238,6 +269,12 @@ function makeConfig(session, resKey, fps, overrides = {}) {
   return {
     input: url, project, adapter: project.adapter,
     workDir, resKey, fps, totalFrames, geom,
+    // Frame-folder identity. Without these every composition in a project
+    // would share one folder and overwrite the others' frames.
+    projectId: session.projectId,
+    entryRel: session.entryRel,
+    entryHash: session.entryHash,
+    bundleCount: session.bundleCount || 1,
     timeOffset, window,
     angle: OPT.angle,
     paintDeterminism: OPT.paintDeterminism,
@@ -247,6 +284,7 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     raster: overrides.raster ?? OPT.raster,
     channel: OPT.channel,
     jobs: overrides.jobs ?? OPT.jobs ?? autoJobs(resKey),
+    sweepMaxRun: OPT.sweepMaxRun,
     quality, preset: OPT.preset, crf: OPT.crf, tenBit: OPT.tenBit,
     deband: OPT.deband, x264Params: OPT.x264,
     audioFile,
@@ -286,6 +324,9 @@ function banner(session, cfg) {
         `${p.scenes.map((x) => x.name).join(', ').slice(0, 44)})`)}`);
     }
     if (cfg.angle) console.log(`  graphics  ${c.dim('ANGLE backend: ' + cfg.angle)}`);
+    // Worth showing: it is per-composition, so two videos in one project can
+    // never overwrite each other's work, and you can see exactly where it went.
+    console.log(`  frames    ${c.dim(path.relative(cfg.workDir, framesDir(cfg)))}`);
     if (cfg.audioFile) console.log(`  audio     ${c.dim(path.basename(cfg.audioFile))}`);
   }
   console.log(c.dim('  ' + '-'.repeat(60)));
@@ -321,6 +362,7 @@ async function advancedMenu(cfg) {
     console.log(`   6) Workers           ${c.b(String(cfg.jobs))}`);
     console.log(`   7) Back`);
     const a = await ask('\n  Choose 1-7: ');
+    if (a === '' && stdinDone) return;
 
     if (a === '1') {
       const keys = Object.keys(QUALITY_PROFILES);
@@ -368,9 +410,10 @@ async function advancedMenu(cfg) {
   }
 }
 
-async function mainMenu(session, initialWindow = null) {
+async function mainMenu(session, initialWindow = null, proj = null) {
   let cfg = null;
   let window = initialWindow;
+  const multi = !!(proj && proj.bundles && proj.bundles.length > 1);
   const ensureCfg = async () => {
     if (cfg) return cfg;
     const pick = await pickOutput(session.project);
@@ -390,10 +433,16 @@ async function mainMenu(session, initialWindow = null) {
     console.log(`   ${c.b('7')}) Choose scenes          ${c.dim(
       window ? `currently: ${window.names.join(' + ')}` : 'currently: whole timeline')}`);
     console.log(`   ${c.b('8')}) Advanced settings`);
-    console.log(`   ${c.b('9')}) Quit`);
+    if (multi) {
+      console.log(`   ${c.b('9')}) ${c.cy('Queue several videos')}    ${c.dim(
+        `render more than one of this project's ${proj.bundles.length} compositions`)}`);
+    }
+    console.log(`   ${c.b('0')}) Quit`);
 
-    const a = await ask('\n  Choose 1-9: ');
-    if (a === '9' || /^q/i.test(a)) return;
+    const a = await ask(`\n  Choose 1-${multi ? '9' : '8'} (0 to quit): `);
+    if (a === '0' || /^q/i.test(a) || (a === '' && stdinDone)) return;
+
+    if (a === '9' && multi) { await queueMenu(proj, session); continue; }
 
     if (a === '6') {
       const p = await pickOutput(session.project);
@@ -434,8 +483,34 @@ async function mainMenu(session, initialWindow = null) {
       await run(k, action);
       continue;
     }
-    console.log(c.r('  Please choose 1-9.'));
+    console.log(c.r(`  Please choose 1-${multi ? '9' : '8'}, or 0 to quit.`));
   }
+}
+
+/** Pick some of the project's compositions and render them back to back. */
+async function queueMenu(proj, session) {
+  printBundles(proj.bundles);
+  console.log(c.dim('\n  Each one renders into its own frame folder and its own file,'));
+  console.log(c.dim('  so nothing you have already rendered is touched.'));
+  const v = await ask('\n  Queue which? number, range, name, or blank for all: ');
+  const items = resolveQueue(proj.bundles, v.trim() || 'all');
+  if (!items.length) { console.log(c.r('  Nothing matched.')); return; }
+
+  // The resolution menu only needs a composition's shape to show sizes, and
+  // probing every queued bundle just to draw that menu would cost a browser
+  // launch each. The one already open is representative enough.
+  const pick = await pickOutput(session.project);
+  console.log(c.dim(`\n  Queued ${items.length}:`));
+  items.forEach((b, i) => console.log(c.dim(`    ${i + 1}. ${b.rel}`)));
+  if (!(await confirm(`\n  Render all ${items.length} at ${pick.resKey} / ${pick.fps} fps?`, true))) return;
+
+  await runQueue(items, async (b) => {
+    const s2 = await openBundle(proj, b);
+    const cfg = makeConfig(s2, pick.resKey, pick.fps, {});
+    banner(s2, cfg);
+    const res = await run(cfg, 'render');
+    return { ...res, outFile: cfg.outFile };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +561,15 @@ async function renderPreview(session, base, seconds) {
 // Entry
 // ---------------------------------------------------------------------------
 
-async function resolveSession() {
+/**
+ * Open the project once: unpack it if it is a zip, list its compositions, and
+ * put a static server in front of the whole tree.
+ *
+ * Deliberately does NOT probe a bundle. Probing costs a browser launch, and the
+ * queue needs to do it once per composition rather than once per run, so the
+ * two steps are separate: openProject() is the part that happens once.
+ */
+async function openProject() {
   let inputPath = OPT.input;
 
   if (!inputPath) {
@@ -508,36 +591,69 @@ async function resolveSession() {
   }
 
   const resolved = resolveInput(inputPath);
+  const all = resolved.bundles || [];
+  const bundles = (all.filter((b) => b.looksLikeBundle).length ? all.filter((b) => b.looksLikeBundle) : all);
+  // Every composition gets its own name up front, computed against the others
+  // so no two can end up writing the same mp4.
+  bundleNames(bundles).forEach((n, i) => { bundles[i].name = n; });
+  const server = await startServer(resolved.rootDir);
 
-  // A Claude Code zip commonly holds several compositions. Pick deliberately
-  // rather than silently rendering whichever one scored highest.
-  const bundles = (resolved.bundles || []).filter((b) => b.looksLikeBundle);
-  let entryFile = resolved.entryFile;
+  // Zip projects live in a temp dir that disappears at exit, so frames and
+  // videos go next to the zip instead.
+  const workDir = resolved.fromZip
+    ? path.dirname(path.resolve(inputPath))
+    : resolved.rootDir;
+  const baseName = resolved.fromZip
+    ? path.basename(inputPath).replace(/\.zip$/i, '')
+    : path.basename(resolved.rootDir);
+
+  return {
+    inputPath, rootDir: resolved.rootDir, fromZip: resolved.fromZip,
+    all, bundles,
+    defaultEntry: resolved.entryFile,
+    workDir, baseName: baseName || 'output',
+    server,
+    cleanup: async () => { await server.close(); resolved.cleanup(); },
+  };
+}
+
+/** Resolve --entry (or a menu choice) to one bundle in the project. */
+async function pickBundle(proj) {
   if (OPT.entry) {
     const want = OPT.entry.replace(/\\/g, '/').toLowerCase();
-    const hit = (resolved.bundles || []).find(
+    const hit = proj.all.find(
       (b) => b.rel.toLowerCase() === want || b.rel.toLowerCase().endsWith('/' + want) ||
              path.basename(b.rel).toLowerCase() === want);
     if (!hit) {
       throw new Error(`No bundle matching --entry "${OPT.entry}".\n  Available:\n   - ` +
-        (resolved.bundles || []).map((b) => b.rel).join('\n   - '));
+        proj.all.map((b) => b.rel).join('\n   - '));
     }
-    entryFile = hit.fp;
-  } else if (bundles.length > 1) {
-    console.log(c.dim(`\n  This project contains ${bundles.length} separate compositions.`));
-    const i = await choose('Which one do you want to render?', bundles.slice(0, 9).map((b) => ({
+    return hit;
+  }
+  if (proj.bundles.length > 1 && !OPT.yes) {
+    console.log(c.dim(`\n  This project contains ${proj.bundles.length} separate compositions.`));
+    console.log(c.dim('  (to render all of them in one go, re-run with --all)'));
+    const i = await choose('Which one do you want to render?', proj.bundles.slice(0, 9).map((b) => ({
       label: b.rel,
       note: b.durationHint
         ? `${b.durationHint}s · ${b.scenes.length} scene(s): ${b.scenes.map((x) => x.name).join(', ').slice(0, 46)}`
         : '',
     })), 0);
-    entryFile = bundles[i].fp;
+    return proj.bundles[i];
   }
+  return proj.bundles.find((b) => b.fp === proj.defaultEntry) || proj.bundles[0] ||
+    { fp: proj.defaultEntry, rel: path.basename(proj.defaultEntry), name: null };
+}
 
-  const server = await startServer(resolved.rootDir);
-  const rel = path.relative(resolved.rootDir, entryFile).split(path.sep).join('/');
+/**
+ * Probe one composition and build the session the rest of the tool works with.
+ * Called once per queued item, so everything here has to be per-bundle.
+ */
+async function openBundle(proj, bundle) {
+  const entryFile = bundle.fp;
+  const rel = path.relative(proj.rootDir, entryFile).split(path.sep).join('/');
   // ?__render=1 is what the Stage starter looks for; harmless for other bundles.
-  const url = `${server.origin}/${encodeURI(rel)}?__render=1`;
+  const url = `${proj.server.origin}/${encodeURI(rel)}?__render=1`;
 
   console.log(c.dim('\n  Reading the bundle...'));
   const probe = await probeProject(url, {
@@ -559,6 +675,7 @@ async function resolveSession() {
   }
   if (!(project.duration > 0)) {
     if (OPT.duration) project.duration = OPT.duration;
+    else if (OPT.yes) project.duration = 10;
     else {
       console.log(c.y(`\n  This page does not report a duration (${project.adapterLabel}).`));
       const v = await ask('  How many seconds should the video be? [Enter = 10]: ');
@@ -566,27 +683,47 @@ async function resolveSession() {
     }
   }
 
-  // Zip projects live in a temp dir; put output next to the zip instead.
-  const workDir = resolved.fromZip
-    ? path.dirname(path.resolve(inputPath))
-    : resolved.rootDir;
-
-  const baseName = resolved.fromZip
-    ? path.basename(inputPath).replace(/\.zip$/i, '')
-    : path.basename(resolved.rootDir);
-  // With several compositions in one project, the file name must say which.
-  const name = bundles.length > 1
-    ? `${baseName}_${path.basename(entryFile).replace(/\.html?$/i, '')}`
-    : (baseName || 'output');
+  const key = projectKey(proj.rootDir, entryFile, proj.baseName, bundle.name);
+  // With several compositions in one project, the output file name must say
+  // WHICH one -- and it has to come from the path, because they are all called
+  // index.html. Without this a queue of four videos leaves you one file.
+  const name = proj.bundles.length > 1
+    ? `${proj.baseName}_${bundle.name || key.name}`
+    : proj.baseName;
 
   return {
     project, url,
-    rootDir: resolved.rootDir,
+    rootDir: proj.rootDir,
     entryFile,
-    workDir,
+    workDir: proj.workDir,
     name,
-    cleanup: async () => { await server.close(); resolved.cleanup(); },
+    projectId: key.id,
+    entryRel: key.rel,
+    entryHash: fileHash(entryFile),
+    bundleCount: proj.bundles.length,
+    cleanup: async () => {},          // the project owns the server
   };
+}
+
+/**
+ * Render one bundle end to end, unattended. This is the queue's unit of work,
+ * so it takes no prompts and returns a result instead of throwing.
+ */
+async function renderQueued(proj, bundle) {
+  const session = await openBundle(proj, bundle);
+  const scenes = session.project.scenes || [];
+  let window = null;
+  if (OPT.scene) {
+    window = resolveSelection(scenes, OPT.scene);
+    // A scene selection that means nothing for THIS composition is not a reason
+    // to abandon the item -- the queue renders whatever the name does match, and
+    // the whole timeline where it matches nothing.
+    if (!window) console.log(c.y(`  No scene matched "${OPT.scene}" here; rendering the whole timeline.`));
+  }
+  const cfg = makeConfig(session, OPT.res || '4k', OPT.fps || 60, { window });
+  banner(session, cfg);
+  const res = await run(cfg, OPT.action && OPT.action !== 'doctor' ? OPT.action : 'render');
+  return { ...res, outFile: cfg.outFile };
 }
 
 (async () => {
@@ -597,8 +734,43 @@ async function resolveSession() {
     console.log(c.y('  encoded. Run `npm install` in this folder to fetch the bundled build.'));
   }
 
-  const session = await resolveSession();
+  const proj = await openProject();
   try {
+    if (OPT.listEntries) {
+      printBundles(proj.bundles);
+      console.log(c.dim(`\n  Render one with --entry <path>, or all of them with --all.\n`));
+      return;
+    }
+
+    // ---- queue ---------------------------------------------------------------
+    if (OPT.all || OPT.queue) {
+      if (OPT.out) {
+        console.log(c.y('\n  --out names a single file, so it cannot be combined with a queue.'));
+        console.log(c.dim('  Each queued composition writes its own file next to the project.'));
+        process.exitCode = 1;
+        return;
+      }
+      const items = resolveQueue(proj.bundles, OPT.all ? 'all' : OPT.queue);
+      if (!items.length) {
+        console.log(c.r(`\n  Nothing in this project matched --queue "${OPT.queue}".`));
+        printBundles(proj.bundles);
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+      console.log(c.dim(`\n  Queued ${items.length} composition(s):`));
+      items.forEach((b, i) => console.log(c.dim(`    ${i + 1}. ${b.rel}`)));
+      if (!OPT.yes && !(await confirm(`\n  Render all ${items.length} now?`, true))) return;
+
+      const results = await runQueue(items, (b) => renderQueued(proj, b));
+      if (results.some((r) => !r.ok)) process.exitCode = 1;
+      console.log('');
+      return;
+    }
+
+    // ---- one composition -----------------------------------------------------
+    const bundle = await pickBundle(proj);
+    const session = await openBundle(proj, bundle);
     const scenes = session.project.scenes || [];
 
     if (OPT.listScenes) {
@@ -631,13 +803,15 @@ async function resolveSession() {
       banner(session, cfg);
       if (OPT.action === 'doctor')  { await runDoctor(session, cfg); return; }
       if (OPT.action === 'preview') { await renderPreview(session, cfg, 2); return; }
-      await run(cfg, OPT.action);
+      // A refused or failed render must not look like success to a script.
+      const res = await run(cfg, OPT.action);
+      if (!res || !res.ok) process.exitCode = 1;
       return;
     }
-    await mainMenu(session, window);
+    await mainMenu(session, window, proj);
     console.log('');
   } finally {
-    await session.cleanup();
+    await proj.cleanup();
   }
 })()
   .catch((err) => {

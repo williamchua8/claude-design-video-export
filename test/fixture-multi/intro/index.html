@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CDV multi fixture — intro</title>
+<style>
+  html,body{margin:0;height:100%;background:#101828;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  #stage{position:relative;background:#101828;transform-origin:center center;overflow:hidden}
+  #box{position:absolute;top:60px;width:80px;height:80px;background:#4f8cff;border-radius:10px}
+  #label{position:absolute;left:16px;top:14px;font:600 20px/1.2 system-ui,sans-serif;color:#fff}
+</style>
+<script>window.OM_SCENES = '[{"name":"Open","dur":1},{"name":"Rise","dur":1}]';</script>
+<div id="wrap"><div id="stage" width="320" height="180"
+     data-om-exportable-video-with-duration-secs="2"
+     data-om-sync-seek="true" data-om-fonts-inlined="true">
+  <div id="box"></div><div id="label">intro t=0</div>
+</div></div>
+<script>
+(() => {
+  const stage = document.getElementById('stage');
+  const W = 320, H = 180, DUR = 2;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  stage.style.width = W + 'px'; stage.style.height = H + 'px';
+  stage.style.transform = 'scale(' + s + ')';
+  function applySeek(t) {
+    const u = Math.max(0, Math.min(1, t / DUR));
+    document.getElementById('box').style.left = (20 + u * 200) + 'px';
+    document.getElementById('label').textContent = 'intro t=' + t.toFixed(2);
+  }
+  stage.addEventListener('data-om-seek-to-time-frame', (e) => applySeek(e.detail.time));
+  applySeek(0);
+})();
+</script>

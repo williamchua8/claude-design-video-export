@@ -42,12 +42,11 @@ under whichever one looks right.
 
 ### 1. A section of the screen blinks for a moment
 
-**What it looks like.** Not a blank frame — for one frame, *part* of the
-composition fails to paint. In a real 4K/30 export from the previous script,
-frame 1362 lost the whole `HQ-Core` row and three KPI numbers, and drew a flat
-grey rectangle where they should have been. Frames 1361 and 1363 are both
-correct and identical to each other. At 30 fps that reads as a UI element
-blinking.
+**What it looks like.** Not a blank frame — for a moment, *part* of the
+composition fails to paint. In a real 3840x2160/30 export, frames **1357–1358**
+(t = 45.2 s) both lost the whole `ADDRESS BLOCKS` panel; the rest of the layout
+reflowed up into the space it left. Frames 1356 and 1359 are correct and
+identical to each other. At 30 fps that reads as the UI blinking.
 
 **Cause.** A partial-paint race: the frame was serialised before that subtree
 finished rasterising.
@@ -65,26 +64,57 @@ sweep below is the real guarantee, the trade was a stall risk against an
 unmeasured benefit, so they stay opt-in.
 
 *The dropout sweep* (`lib/sweep.js`) is the guarantee, and it runs by default.
-After capture it scans every frame for one specific signature:
+After capture it scans every frame for one specific signature — stated over a
+**run** of 1 to 4 frames, not a single frame:
 
 ```
-frame i differs a lot from i-1
-frame i differs a lot from i+1
-but i-1 and i+1 agree closely with each other     <- content left and came back
+the frame entering the run differs a lot from the one before it
+the frame after the run differs a lot from the last one in the run
+but the frames BRACKETING the run agree closely with each other
+and the frames INSIDE the run agree closely with each other
+                                        <- content left and came straight back
 ```
 
-Under real motion, `i-1` and `i+1` are the *furthest* apart of the three pairs,
-never the closest, so ordinary animation cannot trigger it. Flagged frames are
-re-rendered, and the re-render is kept **only if it is measurably more
-consistent with its neighbours** — a frame that reproduces identically is
-authored content, so the original is put back untouched. Nothing loops, and
-nothing is silently changed.
+**Runs are the fix for the artefact that survived the first version.** The
+original test asked whether frame *i* differed from both of its neighbours. For
+a two-frame dropout that test can never fire: frame 1357's next neighbour is
+1358, the second half of the same dropout, so they agree and it is skipped —
+and 1358 is skipped for the same reason looking backwards. The artefact is twice
+as visible as a one-frame blink and was invisible to the detector.
 
-Validated against the real export: run over 50 frames of that video it found
-frame 1362 and nothing else — one true positive, zero false positives.
+```
+1356  panel present
+1357  panel gone      <-- mad(1357,1356) = 6.61
+1358  panel gone      <-- mad(1358,1357) = 0.15   <<< what the old test tripped on
+1359  panel present   <-- mad(1359,1358) = 6.60
+```
+
+Under real motion the bracketing frames are the *furthest* apart of the set,
+never the closest, so ordinary animation cannot trigger this however fast it
+moves. A longer run needs a proportionally cleaner signature before it is
+believed, which keeps short authored inserts out.
+
+Flagged frames are re-rendered — **serially, with a longer settle**, since the
+artefact is a race and re-running it under the conditions that lost the race is
+the one approach guaranteed to be unconvincing. The re-render is kept **only if
+it is better on every axis**: the run now blends into what brackets it, and
+neither boundary got worse. A run that reproduces identically is authored
+content, so the original is put back untouched. Nothing loops, and nothing is
+silently changed.
+
+**Validated against real footage.** Across two 1560-frame 4K exports of the same
+project it finds the two-frame dropout at 1357–1358 in one, the single-frame
+dropouts at 1167 and 1362 in the other, and **nothing else in 3120 frames**.
+`test/sweep-test.js` holds the synthetic contract tests, including that fast
+linear motion, scene cuts, slow fades and incoherent excursions all stay unflagged.
 
 Because dropouts are rare, the sweep is cheap: capture and encode still overlap,
 and a second encode pass happens only if a frame was actually repaired.
+
+```
+--sweep-max-run <n>   longest dropout to look for (default 4 frames)
+--no-sweep            skip the check entirely
+```
 
 ### 2. Wall-clock motion (stutter on ambient elements)
 
@@ -166,7 +196,62 @@ Backends available: `default`, `d3d11`, `d3d9`, `gl`, `vulkan`, `swiftshader`.
 - **Resume is trustworthy.** A frame counts as done only if it is a structurally
   complete PNG — a file truncated by a crash is detected and re-rendered, not
   baked into the master.
-- `--reap` deletes each frame once it has been encoded, if disk is tight.
+- `--reap` deletes each frame once it has been encoded, if disk is tight. It now
+  runs *after* the dropout sweep rather than during the encode, because the
+  sweep has to read the frames back.
+
+### 5. Two videos fighting over one frame folder
+
+**What it looks like.** You render video A, then video B from the same project.
+B reports its frames as "already on disk", encodes in seconds, and turns out to
+be a copy of A. Or you pass `--fresh` and B deletes A's frames. Or you run both
+at once and each one ends up with a mixture of the two. None of it announces
+itself: the frames are all the right *size*, so the size-conflict guard stays
+quiet, and the video looks plausible until you watch it.
+
+**Cause.** Frames were filed under `<project>/frames/<W>x<H>@<fps>` — keyed by
+output format and nothing else. A Claude Code zip routinely holds several
+compositions, and they all resolved to the same folder. The same collision hit
+the output file, because every bundle in such a zip is called `index.html`.
+
+**Fix.** A frame folder is now keyed by *which composition it belongs to* as
+well as what shape it is, and the output name comes from the bundle's path
+rather than its file name:
+
+```
+project/
+  frames/
+    myzip_intro-fc2cc7/1920x1080@24/     <- intro/index.html
+    myzip_outro-a135cf/1920x1080@24/     <- outro/index.html
+  myzip_intro_1920x1080_24fps.mp4
+  myzip_outro_1920x1080_24fps.mp4
+```
+
+Identity is the entry's path *inside* the project, not a hash of its contents.
+That is deliberate: hashing would give every edit of the bundle a brand-new
+folder and silently orphan the frames you already paid for. The content hash
+goes into `settings.json` instead, so a changed bundle produces a warning you
+can act on rather than a surprise.
+
+While a render is using a folder it holds a heartbeated lock file there. A
+second render that wants the same folder is **refused with the name of the
+process holding it**, instead of quietly joining in:
+
+```
+  Another render is already using this frame folder.
+    .../frames/myzip_intro-fc2cc7/1920x1080@24
+    held by pid 10309 on my-laptop (1920x1080@24), last seen 1s ago
+```
+
+Two *different* compositions render side by side perfectly happily — that is the
+whole point. A lock left behind by a killed process goes stale after 90 s and is
+reclaimed automatically, so a crash never leaves a folder unusable.
+
+**Your existing frames are safe.** Frames in the old layout are *moved* into the
+new per-composition folder on the first run and reused, so nothing is
+re-rendered. If the project holds more than one composition there is no way to
+know whose frames those are, so they are left exactly where they are and the
+tool says so.
 
 ---
 
@@ -218,6 +303,44 @@ want all of it.
 **Several videos in one zip.** Every bundle in the project is detected and you
 are asked which one to render (or pass `--entry`). The chosen one's name goes
 into the output filename so exports do not collide.
+
+```bash
+node render.js --input project.zip --list-entries
+```
+
+```
+   1) intro/index.html    8s · 2 scene(s): Open, Rise
+   2) body/index.html    32s · 4 scene(s): Silos, Unify, OnePane, IPAM
+   3) outro/index.html    5s · 1 scene(s): Close
+```
+
+**Or queue them and walk away.** A 4K export is long enough that "come back in
+ten minutes, then answer three questions, then come back again" is the whole
+cost of a multi-video project:
+
+```bash
+node render.js --input project.zip --all              # every composition
+node render.js --input project.zip --queue 1,3        # just these two
+node render.js --input project.zip --queue 2-4        # a range
+node render.js --input project.zip --queue "intro,outro"
+```
+
+The queue **never stops on a failure** — one composition that will not render is
+not a reason to abandon the other three. Each item gets its own frame folder,
+its own lock and its own output file, and the summary at the end says which
+succeeded and which did not:
+
+```
+  Queue finished  18s total
+    ok   intro/index.html    9s  myzip_intro_1920x1080_24fps.mp4
+    ok   outro/index.html    9s  myzip_outro_1920x1080_24fps.mp4
+
+  All 2 rendered.
+```
+
+Re-running the queue retries only what is left: finished frames are reused, so
+it picks up where it stopped. The interactive menu has the same thing as option
+`9) Queue several videos`, which appears when the project holds more than one.
 
 **Sections within one video.** The composition declares its own scene list, which
 the tool reads straight out of the bundle:
@@ -274,6 +397,12 @@ node render.js --input project.zip --quality prores --audio voiceover.mp3
 # Resume an interrupted render
 node render.js --input project.zip --action fill
 
+# Render every video in a zip, unattended
+node render.js --input project.zip --all --res 4k --fps 30 -y
+
+# Just two of them
+node render.js --input project.zip --queue "intro,outro"
+
 # One scene only, from a project containing several videos
 node render.js --input project.zip --entry scene-2/index.html --scene IPAM
 
@@ -294,7 +423,18 @@ looks right, use `--software`.
 
 **"An element blinks for a moment."** That is the paint dropout described above,
 and the sweep catches it automatically. If you disabled it with `--no-sweep`, turn
-it back on. If it persists, `--jobs 1` reduces compositor pressure.
+it back on. If a blink is longer than four frames, raise `--sweep-max-run`. If it
+persists, `--jobs 1` reduces compositor pressure.
+
+**"I rendered a second video and got the first one again."** Fixed — frame
+folders are now per-composition (section 5 above). If you are on an older copy,
+delete `frames/` and re-render.
+
+**"Another render is already using this frame folder."** Exactly what it says:
+another process holds that composition/resolution. Wait for it, or render a
+different one — two different compositions run side by side fine. If you are
+certain nothing else is running, the lock goes stale after 90 s and the next
+attempt reclaims it.
 
 **"Capture is slower than I expected."** A composition authored at 4K lays out at
 3840 css px whatever resolution you export, so layout cost is the same at 1080p
@@ -333,15 +473,27 @@ Either export at native size or add `--ss 2`.
 | `lib/frames.js` | Atomic writes and structural PNG validation (resume) |
 | `lib/encode.js` | ffmpeg filter chain and encoder settings |
 | `lib/pipeline.js` | Runs capture and encode concurrently |
+| `lib/workspace.js` | Per-composition frame folders and render locks |
+| `lib/queue.js` | Rendering several compositions back to back |
 | `lib/scenes.js` | Reads the composition's scene list; resolves `--scene` |
 | `lib/sweep.js` | Paint-dropout detection and repair |
 | `lib/pixels.js` | Glow measurement |
 | `lib/doctor.js` | The diagnostic suite |
 | `test/selftest.js` | End-to-end checks against deliberately broken fixtures |
+| `test/sweep-test.js` | Dropout-detector contract (specificity) |
+| `test/workspace-test.js` | Frame-folder isolation, locking, queue selection |
 
 ```bash
-npm run selftest
+npm test            # all three suites
+npm run selftest    # just the browser-backed end-to-end checks
 ```
+
+Fixtures: `test/fixture` (a deliberately wall-clock-driven bundle),
+`test/fixture-clipped` (a glow clipped to a rectangle on purpose),
+`test/fixture-multi` (two compositions both called `index.html`), and
+`test/fixture-blink` (drops a panel for three frames on purpose, so the sweep's
+detect → re-render → *reproduces identically, keep the original* path is
+exercised end to end).
 
 ### Why the input is served over HTTP
 
