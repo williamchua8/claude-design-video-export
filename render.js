@@ -79,6 +79,7 @@ const OPT = {
   sweepMaxRun: Math.max(1, parseInt(val('--sweep-max-run', '4'), 10) || 4),
   sweepSensitivity: val('--sweep-sensitivity', 'normal'),
   noOutliers: has('--no-transition-sweep'),
+  sweepMaxCandidates: val('--sweep-max-candidates', null) ? parseInt(val('--sweep-max-candidates'), 10) : 0,
   redo:      val('--redo', null),
   paintDeterminism: has('--paint-determinism'),
   quality:   val('--quality', 'master'),
@@ -147,7 +148,12 @@ ${c.b('Quality / correctness')}
                             timeline so mid-scene transitions get the right
                             birth time. off disables the virtual clock.
   --ss 1..4                 supersample, then lanczos-downscale on encode
-  --raster gpu|software     (--software is shorthand)
+  --raster gpu|software     (--software is shorthand). software trades a boxier
+                            blur AND broken 3D depth sorting (a card stack
+                            built with preserve-3d/translateZ can render out of
+                            order) for steadier layer-heavy compositing -- see
+                            the README's "software hides elements that should
+                            be in front" if a scene uses either.
   --freeze-timers           also virtualise setTimeout/setInterval
   --verify                  re-render every frame and compare (slow)
   --angle <backend>         graphics backend: ${ANGLE_BACKENDS.join(' | ')}.
@@ -168,6 +174,14 @@ ${c.b('Quality / correctness')}
                             (~1% of frames re-rendered on real footage).
   --no-transition-sweep     only look for dropouts during holds (the original,
                             very specific test) and skip the transition pass
+  --sweep-max-candidates <n>
+                            re-render at most this many suspects per pass
+                            (default: the larger of 40 and 3% of the frame
+                            count). On hardware with a more aggressive paint
+                            race than usual, a badly affected render can hit
+                            this ceiling and leave real dropouts unrepaired
+                            past it -- raise this if the sweep reports
+                            "candidate(s) skipped" and a blink still survives.
   --redo <sel>              re-render these frames whatever the detectors think,
                             then re-encode. For when you can SEE the bad frame.
                             Frame numbers and timestamps are against the FULL
@@ -315,6 +329,7 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     sweepMaxRun: OPT.sweepMaxRun,
     sweepSensitivity: OPT.sweepSensitivity,
     sweepOutliers: !OPT.noOutliers,
+    sweepMaxCandidates: OPT.sweepMaxCandidates,
     redo: OPT.redo ? parseFrameSelection(OPT.redo, fps, totalFrames, frameOffset) : null,
     quality, preset: OPT.preset, crf: OPT.crf, tenBit: OPT.tenBit,
     deband: OPT.deband, x264Params: OPT.x264,
@@ -431,7 +446,7 @@ async function advancedMenu(cfg) {
     } else if (a === '5') {
       const i = await choose('Raster', [
         { label: 'gpu',      note: 'normal compositing path; correct large-blur rendering' },
-        { label: 'software', note: 'steadier on very layer-heavy scenes, but boxier blurs' },
+        { label: 'software', note: 'steadier on layer-heavy scenes, but boxier blurs AND breaks preserve-3d depth order' },
       ], cfg.raster === 'gpu' ? 0 : 1);
       cfg.raster = i === 0 ? 'gpu' : 'software';
     } else if (a === '6') {

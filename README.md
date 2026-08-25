@@ -302,6 +302,42 @@ tool says so.
 
 ---
 
+### 6. `--software` hides elements that should be in front
+
+**What it looks like.** Switch to `--raster software` (or `--software`) — maybe
+because of the paint-dropout problem above — and a panel that should sit in
+front of another, per its own transform, renders *behind* it instead. Under
+`--raster gpu` the same composition, same frame, is correct. This is not the
+boxy-blur problem in section 3; the blur is fine, the *stacking* is wrong.
+
+**Cause.** Confirmed by reading a real Claude Design composition's decompiled
+source rather than guessing: scenes built as a 3D "camera" over a stack of
+cards use `transform-style: preserve-3d` (25 occurrences in one real
+composition) and `translateZ` to place each card at a real depth — one card's
+own code comment explains why: *"Content under perspective() + preserve-3d
+rasterises into a texture, so panel type softens however large the render is."*
+Correct depth sorting for that — a card at `translateZ(40px)` drawing in front
+of one at `translateZ(10px)` regardless of which is later in the DOM — is a GPU
+compositor feature. `--raster software` passes `--disable-gpu
+--disable-gpu-compositing`, and without a GPU compositor Chromium's software
+path falls back to **paint order** (DOM order) instead of true 3D depth. A
+card stack is exactly what breaks: this is expected Chromium behaviour with the
+GPU compositor removed, not a bug in this renderer or in the composition.
+
+**Fix.** Use `--raster gpu` (the default) for anything with a card stack, a
+depth camera, or `preserve-3d` in general — reach for `--software` only for the
+paint-dropout / layer-pressure case it exists for, on a composition that does
+not depend on 3D stacking. If a composition needs *both* — it drops frames
+under `gpu` AND uses `preserve-3d` — the dropout sweep (on by default, see
+section 1) is the fix that does not cost you 3D correctness; try
+`--paint-determinism` and `--jobs 1` before reaching for `--software`.
+
+There is no code fix for this in the renderer: it is Chromium's own software
+compositor behaviour, and disabling the GPU compositor is what `--software`
+*is*. `--angle swiftshader` is not the same thing — it keeps the GPU compositor
+enabled and only swaps which driver rasterises through it, so it does not lose
+3D depth sorting and is the right tool for a driver-specific blur bug instead.
+
 ## Encoder settings, and why
 
 **CRF, not a bitrate target.** A flat dark motion-graphics frame with thin

@@ -8,7 +8,7 @@
 // dropouts (a two-frame one in the first, two single-frame ones in the second)
 // and nothing else in 3120 frames.
 
-import { detectDropouts, detectOutliers, detectCandidates } from '../lib/sweep.js';
+import { detectDropouts, detectOutliers, detectCandidates, SENSITIVITY } from '../lib/sweep.js';
 import { c } from '../lib/util.js';
 
 const W = 32, H = 18, FB = W * H;
@@ -198,6 +198,47 @@ const fading = (i, gone) => (x, y) => ((!gone && y >= 8 && y < 10) ? 220 : LEVEL
   check('with the outlier pass off, the run test still stands alone',
     runs.length === 1 && runs[0].start === 2 && runs[0].len === 2,
     JSON.stringify(runs.map((r) => [r.start, r.len])));
+}
+
+// ---------------------------------------------------------------------------
+// The candidate cap
+// ---------------------------------------------------------------------------
+//
+// A pathological video (or a much noisier compositor than the one this was
+// tuned against) could otherwise turn every sweep into a second full render.
+// --sweep-max-candidates exists so someone hitting the cap in practice has a
+// dial, so the cap itself has to actually cap.
+
+console.log(c.b('\n  Candidate cap\n'));
+
+{
+  // Many independent one-frame dropouts scattered through a still video --
+  // enough to comfortably exceed the default floor of 40.
+  const still = () => 10;
+  const spike = (level) => () => level;
+  const frames = [];
+  for (let i = 0; i < 400; i++) {
+    frames.push(i % 6 === 3 ? spike(220) : still);
+  }
+  const sig = makeSig(frames);
+
+  const uncapped = detectCandidates(sig, { ...SENSITIVITY.normal, maxCandidates: 10000 });
+  check('sanity: this synthetic video does produce more than 40 candidates',
+    uncapped.runs.length > 40, `runs=${uncapped.runs.length}`);
+
+  // maxCandidates only RAISES the floor (the larger of 40, 3% of the frame
+  // count, and maxCandidates) -- it is an escape hatch for a badly affected
+  // render, not a way to make the sweep skip more than the safety floor does.
+  const atDefault = detectCandidates(sig, { ...SENSITIVITY.normal });
+  check('with no override the built-in floor (40 here) still caps the list',
+    atDefault.runs.length === 40, `runs=${atDefault.runs.length}`);
+  check('and it reports how many it left out',
+    atDefault.capped === uncapped.runs.length - atDefault.runs.length,
+    `capped=${atDefault.capped}`);
+
+  const raised = detectCandidates(sig, { ...SENSITIVITY.normal, maxCandidates: 60 });
+  check('--sweep-max-candidates raises the cap above the default floor',
+    raised.runs.length === 60, `runs=${raised.runs.length}`);
 }
 
 console.log(`\n  ${failures ? c.r(`${failures} failed`) : c.g('all passed')}\n`);
