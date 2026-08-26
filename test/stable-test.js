@@ -9,7 +9,7 @@
 // the picture is already stable (costing exactly one extra shot), keep shooting
 // while it changes, and give up rather than spin when it never settles.
 
-import { shootStable } from '../lib/capture.js';
+import { shootStable, makeStableState, stableNeedFor, stableObserve, PROBE_FRAMES, REPROBE_EVERY } from '../lib/capture.js';
 import { c } from '../lib/util.js';
 
 let failures = 0;
@@ -88,6 +88,86 @@ console.log(c.b('\n  Stable capture\n'));
   const r = await shootStable(cam, { need: 3, tries: 3 });
   check('the agreement streak resets when the picture changes again',
     !r.stable, `stable=${r.stable}`);
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive mode
+// ---------------------------------------------------------------------------
+//
+// Whether a machine hands over half-drawn frames is a property of its driver
+// and its load, and the people it happens to are exactly the people who do not
+// know to reach for a flag. So the default measures instead of asking. These
+// cases pin down that it costs a clean machine almost nothing, protects an
+// affected one without being told to, and cannot get stuck in the wrong answer.
+
+console.log(c.b('\n  Adaptive stable capture\n'));
+
+/** Run n frames through the state machine; `bad` says which ones misbehave. */
+const drive = (st, n, bad = () => false) => {
+  const needs = [];
+  let carefulBeforeOn = 0;
+  for (let i = 0; i < n; i++) {
+    const need = stableNeedFor(st);
+    needs.push(need);
+    if (st.mode !== 'on' && need >= 2) carefulBeforeOn++;
+    const misbehaved = need >= 2 && bad(i);
+    stableObserve(st, { need, shots: misbehaved ? need + 1 : need, stable: true });
+  }
+  needs.carefulBeforeOn = carefulBeforeOn;
+  return needs;
+};
+
+{
+  const st = makeStableState({ stableCapture: 'auto' });
+  check('auto starts by probing', st.mode === 'probing' && stableNeedFor(st) === 2);
+}
+
+{
+  // A machine that never misbehaves: probe, then run at full speed.
+  const st = makeStableState({ stableCapture: 'auto' });
+  const needs = drive(st, 100);
+  const careful = needs.filter((n) => n >= 2).length;
+  check('a clean machine pays only for the probe, then runs at one shot',
+    careful === PROBE_FRAMES && st.mode === 'off', `careful=${careful} mode=${st.mode}`);
+}
+
+{
+  // One bad frame during the probe is enough to commit for the whole run.
+  const st = makeStableState({ stableCapture: 'auto' });
+  const needs = drive(st, 100, (i) => i === 3);
+  check('one half-drawn frame during probing turns it on for the rest',
+    st.mode === 'on' && needs.slice(20).every((n) => n >= 2), `mode=${st.mode}`);
+}
+
+{
+  // A machine that only starts misbehaving once warm must still be caught.
+  const st = makeStableState({ stableCapture: 'auto' });
+  drive(st, PROBE_FRAMES + 5);
+  check('sanity: it went to full speed first', st.mode === 'off');
+  const needs = drive(st, REPROBE_EVERY + 5, () => true);
+  check('a re-probe catches a machine that degrades later',
+    st.mode === 'on', `mode=${st.mode}`);
+  // The cost of insurance is what matters here: exactly one careful frame is
+  // spent before the problem is found, not a steady tax on every frame.
+  check('and costs exactly one careful frame to notice',
+    needs.carefulBeforeOn === 1, `careful-before-on=${needs.carefulBeforeOn}`);
+  check('and left the ~250 frames before it at full speed',
+    needs.filter((n) => n === 1).length >= REPROBE_EVERY - 20,
+    `single-shot=${needs.filter((n) => n === 1).length} of ${needs.length}`);
+}
+
+{
+  // Explicit settings must not be second-guessed by the adaptive logic.
+  const on = makeStableState({ stableCapture: 3 });
+  check('an explicit --stable-capture is honoured exactly',
+    on.mode === 'on' && stableNeedFor(on) === 3);
+  drive(on, 50);
+  check('and never downgrades itself', on.mode === 'on' && stableNeedFor(on) === 3);
+
+  const off = makeStableState({ stableCapture: 'off' });
+  check('--no-stable-capture stays off', off.mode === 'off' && stableNeedFor(off) === 1);
+  drive(off, 50);
+  check('and never re-probes', stableNeedFor(off) === 1);
 }
 
 console.log(`\n  ${failures ? c.r(`${failures} failed`) : c.g('all passed')}\n`);

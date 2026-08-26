@@ -331,10 +331,22 @@ is byte-identical however many times you screenshot it — asserted in
 
 So the renderer shoots each frame until two consecutive shots are identical.
 There are **no false positives by construction**, and re-shooting gives the
-compositor another full round, which is all it needed:
+compositor another full round, which is all it needed.
+
+**This is on by default, and adaptive.** Whether a machine has this fault is a
+property of its GPU driver and its load — and the people it happens to are
+exactly the people who would not know to reach for a flag. So the default
+measures instead of asking: the opening 16 frames are captured the careful way,
+and if none of them needed a second look, the rest run at full speed (with a
+cheap re-probe every 250 frames, in case a machine only misbehaves once warm).
+
+A clean machine pays for about 16 extra screenshots in a thousand-frame render.
+An affected one is protected without having been told to ask.
 
 ```bash
-node render.js --input project.zip --stable-capture
+node render.js --input project.zip                    # adaptive (default)
+node render.js --input project.zip --stable-capture   # force on for every frame
+node render.js --input project.zip --no-stable-capture  # never re-shoot
 ```
 
 ```
@@ -343,15 +355,40 @@ node render.js --input project.zip --stable-capture
     Those would have exported with missing content without --stable-capture.
 ```
 
-It costs about one extra screenshot per frame, which is why it is opt-in rather
-than always on — and why it is still much cheaper than repairing dozens of
-frames after the fact. The dropout sweep turns it on for its own repairs
-regardless, since by then a frame is already known to be suspect.
+Forced on, it costs about one extra screenshot per frame — still far cheaper
+than repairing dozens of frames after the fact. The dropout sweep turns it on
+for its own repairs regardless, since by then a frame is already known to be
+suspect, and the doctor forces it on for every measurement it takes.
 
 ```
---stable-capture [n]   require n consecutive identical shots (default 2)
---stable-tries <n>     give up re-shooting after n attempts (default 4)
+--stable-capture [n]     require n consecutive identical shots (default 2)
+--no-stable-capture      trust the first picture every time
+--stable-tries <n>       give up re-shooting after n attempts (default 4)
 ```
+
+**Measured on a real affected machine** (Zenbook S16, AMD Radeon 890M), same
+402-frame scene, before and after:
+
+| | suspect frames |
+|---|---|
+| before | 40 flagged **+ 9 past the cap** (~12% of the scene) |
+| after | **1** |
+
+**It also fixes what the doctor tells you.** A machine with this fault and a
+composition full of wall-clock motion produce the *same* symptom — "the same
+timestamp rendered twice came out different" — and they need opposite fixes.
+The doctor used to measure that with plain captures, so on an affected machine
+it blamed the composition and recommended `--freeze-timers` / `--time replay`,
+which do nothing for a paint race. Observed on a real report: a composition
+that renders byte-identically three times in a row on unaffected hardware was
+reported as "not reachable from the virtual clock".
+
+Every measurement the doctor takes now forces stable capture on, so the
+compositor is out of the picture and what is left is genuinely the page. The
+verdict names which of the two faults it found, and says explicitly not to
+reach for the other one's fix. The render-path comparison is captured the same
+way, so a half-drawn shot can no longer manufacture a "these paths disagree"
+that is really just the race.
 
 **Find out whether you need it.** The doctor now answers this directly, by
 shooting one pinned frame repeatedly *under parallel load* — the fault is
@@ -630,10 +667,17 @@ Run `node render.js --help` for the full flag list.
 full build and variant **A** still looks wrong while **C** (software raster)
 looks right, use `--software`.
 
-**"Panels or rows come out missing."** Add `--stable-capture` (section 6). Run
-`--action doctor` first if you want it confirmed — its Capture stability check
-tells you whether your machine hands over half-drawn frames. Do not reach for
-`--software`: it is steadier but breaks 3D stacking (section 7).
+**"Panels or rows come out missing."** Adaptive stable capture (section 6) is on
+by default and should catch it. If a few still get through, force it on for
+every frame with `--stable-capture`, and raise `--stable-tries` if the report
+says frames "never settled". `--action doctor` confirms whether your machine
+has the fault at all. Do not reach for `--software`: it is steadier but breaks
+3D stacking (section 7).
+
+**"The doctor says my composition is not reachable from the virtual clock."**
+On a machine with the paint race that used to be a misdiagnosis — see section 6.
+Update, then re-run the doctor: it now separates the two causes and will tell
+you which one you actually have.
 
 **"An element blinks for a moment."** That is the paint dropout described above,
 and the sweep catches it automatically. If you disabled it with `--no-sweep`, turn

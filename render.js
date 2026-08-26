@@ -92,8 +92,12 @@ const OPT = {
   x264:      val('--x264-params', null),
   audio:     val('--audio', null),
   noAudio:   has('--no-audio'),
-  stableCapture: has('--stable-capture') || has('--stable')
-    ? Math.max(2, parseInt(val('--stable-capture', '2'), 10) || 2) : 1,
+  // Default 'auto': measure whether this machine needs the careful capture path
+  // rather than making the person who hits the bug know to ask for the fix.
+  stableCapture: has('--no-stable-capture') ? 'off'
+    : (has('--stable-capture') || has('--stable'))
+      ? Math.max(2, parseInt(val('--stable-capture', '2'), 10) || 2)
+      : 'auto',
   stableTries: Math.max(2, parseInt(val('--stable-tries', '4'), 10) || 4),
   settle:    Math.max(0, parseInt(val('--settle', '0'), 10) || 0),
   warmMs:    Math.max(0, parseInt(val('--warm', '250'), 10) || 250),
@@ -167,14 +171,17 @@ ${c.b('Quality / correctness')}
   --verify                  re-render every frame and compare (slow)
   --stable-capture [n]      THE FIX FOR MISSING CONTENT ON A FAST MACHINE.
                             Screenshot each frame until n consecutive shots are
-                            byte-identical (default 2), instead of trusting the
+                            byte-identical (default 2) instead of trusting the
                             first one. Every clock is pinned, so a correctly
                             drawn frame is always identical shot to shot --
                             which means any disagreement IS the compositor
                             handing over a half-rastered picture, with no false
-                            positives. Costs ~1 extra screenshot per frame.
-                            Use this if panels or rows come out missing and
-                            --software is not an option (it breaks 3D stacking).
+                            positives.
+                            ON BY DEFAULT, ADAPTIVELY: the opening frames are
+                            captured the careful way, and if none of them needed
+                            a second look the rest run at full speed. Pass this
+                            flag to force it on for every frame.
+  --no-stable-capture       never re-shoot; trust the first picture every time
   --stable-tries <n>        give up re-shooting after n attempts (default 4)
   --angle <backend>         graphics backend: ${ANGLE_BACKENDS.join(' | ')}.
                             If a glow renders as a rectangle on your machine but
