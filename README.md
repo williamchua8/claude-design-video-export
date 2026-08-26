@@ -302,7 +302,83 @@ tool says so.
 
 ---
 
-### 6. `--software` hides elements that should be in front
+### 6. Missing panels and rows on a fast machine (the paint race)
+
+**What it looks like.** Panels, rows, or whole card bodies come out missing —
+not blank frames, just *part* of the composition absent, with the layout
+reflowed into the gap. It gets worse on faster machines with more parallelism,
+not better, and `--software` reduces it at the cost of section 7 below.
+
+**What it actually is, measured.** Taking a real 402-frame Energy scene that
+exported with visible dropouts: 40 frames flagged, 9 more past the cap — about
+12% of the scene. Frame 178 had the policy card sliced off mid-body, losing its
+bottom edge and three of four rows.
+
+Then the decisive test. Re-rendering that exact timestamp on its own, three
+times at full 4K, produced **byte-identical and completely correct** frames
+every time — as did the four timestamps around it. The frame is fine when
+rendered calmly and breaks under full-render load. It is a raster race, not
+authored content and not a bug in the composition.
+
+**The fix: `--stable-capture`.** This rests on a property the pipeline already
+guarantees. `determinism.js` pins every clock, so a *correctly rastered* frame
+is byte-identical however many times you screenshot it — asserted in
+`test/selftest.js` and re-confirmed above. Therefore:
+
+> If two consecutive shots of one pinned instant disagree, the difference
+> cannot be animation and cannot be noise. Part of the layer tree had not
+> finished rasterising when the first one was serialised.
+
+So the renderer shoots each frame until two consecutive shots are identical.
+There are **no false positives by construction**, and re-shooting gives the
+compositor another full round, which is all it needed:
+
+```bash
+node render.js --input project.zip --stable-capture
+```
+
+```
+  Stable capture caught 23 half-drawn frame(s) — each was re-shot until the
+  picture stopped changing.
+    Those would have exported with missing content without --stable-capture.
+```
+
+It costs about one extra screenshot per frame, which is why it is opt-in rather
+than always on — and why it is still much cheaper than repairing dozens of
+frames after the fact. The dropout sweep turns it on for its own repairs
+regardless, since by then a frame is already known to be suspect.
+
+```
+--stable-capture [n]   require n consecutive identical shots (default 2)
+--stable-tries <n>     give up re-shooting after n attempts (default 4)
+```
+
+**Find out whether you need it.** The doctor now answers this directly, by
+shooting one pinned frame repeatedly *under parallel load* — the fault is
+load-dependent, so an idle measurement would tell exactly the wrong people they
+are fine:
+
+```bash
+node render.js --input project.zip --action doctor
+```
+
+```
+  Capture stability
+  identical shots   6/6 across 2 parallel worker(s)
+  Every shot identical — this machine composites cleanly at this load.
+```
+
+If it reports shots coming back different, that machine does have the problem
+and every one of those would have exported with content missing.
+
+**Other levers**, in the order worth trying: `--jobs` lower (less contention
+is less race), `--paint-determinism` (compositor flags that force paint to
+finish — off by default because they can deadlock the screenshot call), and
+`--cpu-raster` (section 7). Reach for `--software` last, for the reason below.
+
+---
+
+### 7. `--software` hides elements that should be in front
 
 **What it looks like.** Switch to `--raster software` (or `--software`) — maybe
 because of the paint-dropout problem above — and a panel that should sit in
@@ -325,12 +401,30 @@ card stack is exactly what breaks: this is expected Chromium behaviour with the
 GPU compositor removed, not a bug in this renderer or in the composition.
 
 **Fix.** Use `--raster gpu` (the default) for anything with a card stack, a
-depth camera, or `preserve-3d` in general — reach for `--software` only for the
-paint-dropout / layer-pressure case it exists for, on a composition that does
-not depend on 3D stacking. If a composition needs *both* — it drops frames
-under `gpu` AND uses `preserve-3d` — the dropout sweep (on by default, see
-section 1) is the fix that does not cost you 3D correctness; try
-`--paint-determinism` and `--jobs 1` before reaching for `--software`.
+depth camera, or `preserve-3d` in general.
+
+If a composition needs *both* — it drops frames under `gpu` **and** uses
+`preserve-3d` — that is the exact trade section 6 removes. `--stable-capture`
+fixes the dropouts while staying on `gpu`, so 3D stacking is never given up.
+Reach for that first.
+
+There is also a middle raster mode, because two separate things get called
+"software" and conflating them is what forces the bad trade:
+
+| | GPU fills the tiles | GPU assembles the layers | 3D depth sorting |
+|---|---|---|---|
+| `--raster gpu` (default) | yes | yes | correct |
+| `--raster cpu-raster` | no | **yes** | **correct** |
+| `--raster software` | no | no | **broken** |
+
+`--disable-gpu-compositing` is the flag that loses depth sorting, and only
+`software` passes it. `--cpu-raster` takes the tile-filling work off the GPU
+driver while keeping the compositor, so it can be steadier than `gpu` without
+reordering your cards. Being straight about the evidence: this is reasoned from
+what each Chromium flag does, not measured, because this sandbox has no
+discrete GPU — `gpu` is already SwiftShader in it, so the driver-specific fault
+cannot be reproduced here. Try it against `--stable-capture` and keep whichever
+is faster on your machine.
 
 There is no code fix for this in the renderer: it is Chromium's own software
 compositor behaviour, and disabling the GPU compositor is what `--software`
@@ -536,6 +630,11 @@ Run `node render.js --help` for the full flag list.
 full build and variant **A** still looks wrong while **C** (software raster)
 looks right, use `--software`.
 
+**"Panels or rows come out missing."** Add `--stable-capture` (section 6). Run
+`--action doctor` first if you want it confirmed — its Capture stability check
+tells you whether your machine hands over half-drawn frames. Do not reach for
+`--software`: it is steadier but breaks 3D stacking (section 7).
+
 **"An element blinks for a moment."** That is the paint dropout described above,
 and the sweep catches it automatically. If you disabled it with `--no-sweep`, turn
 it back on. If a blink is longer than four frames, raise `--sweep-max-run`.
@@ -616,9 +715,10 @@ the old scene's frame folder or just let it re-render.
 | `test/selftest.js` | End-to-end checks against deliberately broken fixtures |
 | `test/sweep-test.js` | Dropout-detector contract (specificity) |
 | `test/workspace-test.js` | Frame-folder isolation, locking, queue selection |
+| `test/stable-test.js` | Stable capture: settles fast, gives up rather than spins |
 
 ```bash
-npm test            # all three suites
+npm test            # all four suites
 npm run selftest    # just the browser-backed end-to-end checks
 ```
 

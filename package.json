@@ -17,8 +17,9 @@
     "selftest": "node test/selftest.js",
     "sweeptest": "node test/sweep-test.js",
     "workspacetest": "node test/workspace-test.js",
-    "test": "node test/sweep-test.js && node test/workspace-test.js && node test/selftest.js",
-    "queue": "node render.js --all"
+    "test": "node test/sweep-test.js && node test/workspace-test.js && node test/stable-test.js && node test/selftest.js",
+    "queue": "node render.js --all",
+    "stabletest": "node test/stable-test.js"
   },
   "dependencies": {
     "ffmpeg-static": "^5.2.0",

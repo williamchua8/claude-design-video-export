@@ -26,7 +26,7 @@ import { resolveQueue, printBundles, runQueue } from './lib/queue.js';
 import { projectKey, bundleNames, fileHash, framesDir } from './lib/workspace.js';
 import { QUALITY_PROFILES, ffmpegBin, findAudio } from './lib/encode.js';
 import { runDoctor } from './lib/doctor.js';
-import { ANGLE_BACKENDS } from './lib/browser.js';
+import { ANGLE_BACKENDS, RASTER_MODES } from './lib/browser.js';
 import { c, fmtDuration, clamp, even, parseFrameSelection } from './lib/util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -66,7 +66,9 @@ const OPT = {
   scaleMode: val('--scale-mode', 'dpr'),   // dpr | layout
   timeMode:  val('--time', 'absolute'),    // absolute | replay | off
   freezeTimers: has('--freeze-timers'),
-  raster:    has('--software') ? 'software' : val('--raster', 'gpu'),
+  raster:    has('--software') ? 'software'
+           : has('--cpu-raster') ? 'cpu-raster'
+           : val('--raster', 'gpu'),
   channel:   val('--channel', null),
   angle:     val('--angle', null),         // default|d3d11|d3d9|gl|vulkan|swiftshader
   entry:     val('--entry', null),         // which bundle inside a zip/folder
@@ -90,6 +92,9 @@ const OPT = {
   x264:      val('--x264-params', null),
   audio:     val('--audio', null),
   noAudio:   has('--no-audio'),
+  stableCapture: has('--stable-capture') || has('--stable')
+    ? Math.max(2, parseInt(val('--stable-capture', '2'), 10) || 2) : 1,
+  stableTries: Math.max(2, parseInt(val('--stable-tries', '4'), 10) || 4),
   settle:    Math.max(0, parseInt(val('--settle', '0'), 10) || 0),
   warmMs:    Math.max(0, parseInt(val('--warm', '250'), 10) || 250),
   warmStride: num('--warm-stride', 1 / 15),
@@ -148,14 +153,29 @@ ${c.b('Quality / correctness')}
                             timeline so mid-scene transitions get the right
                             birth time. off disables the virtual clock.
   --ss 1..4                 supersample, then lanczos-downscale on encode
-  --raster gpu|software     (--software is shorthand). software trades a boxier
-                            blur AND broken 3D depth sorting (a card stack
-                            built with preserve-3d/translateZ can render out of
-                            order) for steadier layer-heavy compositing -- see
-                            the README's "software hides elements that should
-                            be in front" if a scene uses either.
+  --raster gpu|cpu-raster|software
+                            gpu (default) is the faithful path. software
+                            (--software) is steadier on layer-heavy scenes but
+                            gives up TWO things: boxier blurs AND real 3D depth
+                            sorting, so a card stack built with preserve-3d /
+                            translateZ can render out of order.
+                            cpu-raster (--cpu-raster) is the middle option:
+                            tiles are filled on the CPU but the GPU compositor
+                            is kept, so 3D stacking stays correct. Reach for it
+                            when gpu drops frames and software reorders cards.
   --freeze-timers           also virtualise setTimeout/setInterval
   --verify                  re-render every frame and compare (slow)
+  --stable-capture [n]      THE FIX FOR MISSING CONTENT ON A FAST MACHINE.
+                            Screenshot each frame until n consecutive shots are
+                            byte-identical (default 2), instead of trusting the
+                            first one. Every clock is pinned, so a correctly
+                            drawn frame is always identical shot to shot --
+                            which means any disagreement IS the compositor
+                            handing over a half-rastered picture, with no false
+                            positives. Costs ~1 extra screenshot per frame.
+                            Use this if panels or rows come out missing and
+                            --software is not an option (it breaks 3D stacking).
+  --stable-tries <n>        give up re-shooting after n attempts (default 4)
   --angle <backend>         graphics backend: ${ANGLE_BACKENDS.join(' | ')}.
                             If a glow renders as a rectangle on your machine but
                             looks right elsewhere, try --angle swiftshader: it
@@ -335,6 +355,8 @@ function makeConfig(session, resKey, fps, overrides = {}) {
     deband: OPT.deband, x264Params: OPT.x264,
     audioFile,
     sceneTag,
+    stableCapture: OPT.stableCapture,
+    stableTries: OPT.stableTries,
     settleMs: OPT.settle, warmMs: OPT.warmMs, warmStride: OPT.warmStride,
     chunkFrames: 0,
     timeout: OPT.timeout, verify: OPT.verify, fresh: OPT.fresh,
@@ -445,10 +467,11 @@ async function advancedMenu(cfg) {
       });
     } else if (a === '5') {
       const i = await choose('Raster', [
-        { label: 'gpu',      note: 'normal compositing path; correct large-blur rendering' },
-        { label: 'software', note: 'steadier on layer-heavy scenes, but boxier blurs AND breaks preserve-3d depth order' },
-      ], cfg.raster === 'gpu' ? 0 : 1);
-      cfg.raster = i === 0 ? 'gpu' : 'software';
+        { label: 'gpu',        note: 'normal compositing path; correct large-blur and 3D rendering' },
+        { label: 'cpu-raster', note: 'CPU fills the tiles, GPU still composites — steadier, and 3D stacking stays correct' },
+        { label: 'software',   note: 'all software: steadier still, but boxier blurs AND breaks preserve-3d depth order' },
+      ], Math.max(0, RASTER_MODES.indexOf(cfg.raster)));
+      cfg.raster = RASTER_MODES[i];
     } else if (a === '6') {
       const v = await ask(`  Workers 1-8 ${c.dim(`[Enter = ${cfg.jobs}]`)}: `);
       const n = v === '' ? cfg.jobs : parseInt(v, 10);
@@ -571,6 +594,12 @@ async function run(cfg, action) {
   // a typo should not silently start an hour of work.
   if (!ACTIONS.includes(action)) {
     throw new Error(`Unknown --action "${action}". Valid: ${ACTIONS.join(', ')}`);
+  }
+  // Same reasoning as the action check: a mistyped raster mode would otherwise
+  // silently fall through to the default and render the whole thing on the
+  // path the user was explicitly trying to avoid.
+  if (!RASTER_MODES.includes(cfg.raster)) {
+    throw new Error(`Unknown --raster "${cfg.raster}". Valid: ${RASTER_MODES.join(', ')}`);
   }
   const t0 = Date.now();
   let res;
