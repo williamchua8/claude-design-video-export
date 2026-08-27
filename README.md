@@ -730,50 +730,67 @@ on the GPU path and use `--cpu-raster` until it is resolved. This is worth
 taking seriously and it is worth being precise about.
 
 Observed on a real machine (Asus laptop, AMD Radeon 890M): repeated unclean
-shutdowns during long 4K renders, and none on `--cpu-raster`. Reading its
-Windows event log gave a picture worth recording, because the obvious reading
-was wrong:
+shutdowns during long 4K renders, and none on `--cpu-raster`. Three rounds of
+evidence, escalating from log analysis to a live sensor capture during an
+actual reproduction:
 
-- **They were not blue screens.** Every one logged `BugcheckCode: 0` — no stop
-  code, no crash dump, no WHEA hardware error, no long power-button press. A
-  real BSOD records a bugcheck. `BugcheckCode 0` is a hard hang or power-off
-  that Windows never got to catch, which is a *different* fault from a driver
-  crash and rules out most of what you would investigate for a BSOD.
-- **The fault predated the renderer.** 29 unclean shutdowns across eight months,
-  in every single month, long before this tool touched the machine.
-- **But the render amplified it enormously** — seven in one 52-minute evening
-  session against a baseline of about one a month.
-- **Every one involved Modern Standby**, bracketed by connected-standby entry
-  and exit events and followed by "standby budget exhausted".
+**Windows Event Log said nothing crashed.** Every unclean shutdown logged
+`BugcheckCode: 0` — no stop code, no crash dump, no WHEA hardware error, no
+long power-button press. A real BSOD records a bugcheck; this is a hard hang
+or power-off Windows never got the chance to catch. The fault predated the
+renderer (29 unclean shutdowns across eight months, every month), but the
+render amplified it enormously — seven in one 52-minute session against a
+baseline of about one a month. A full 8-month, 39,000-record unfiltered System
+log turned up zero genuine GPU driver reset, TDR, or hardware-error events;
+`LiveKernelReports\WATCHDOG` (where a recovered GPU hang would leave a dump)
+was empty for the entire incident window.
+
+**Live sensor logging (HWiNFO) during a reproduction confirmed why.** For the
+full duration of a `--raster gpu` render, `CPU (Tctl/Tdie)` sat at 95-99.5°C —
+pinned to AMD's ~100°C thermal ceiling essentially the whole time, not just
+spiking. Hardware protection was engaging repeatedly: `Throttle Reason -
+Thermal` fired on 64 of 340 samples, `Thermal Throttling (PROCHOT EXT)` on 41
+of 340. The specific and telling detail: `PROCHOT CPU` (the CPU die's own
+internal cutoff) **never fired, not once** — only `PROCHOT EXT`, which means an
+*external* sensor (VRM or chassis/skin temperature, asserted via the embedded
+controller) was hitting its limit before the CPU die itself did. That points at
+this laptop's cooling/VRM thermal design under sustained combined CPU+GPU load,
+not a CPU defect.
 
 The honest conclusion: a user-space program should not be able to hard-kill a
-machine, so this is a platform, driver, or firmware defect. A heavy sustained
-GPU workload is the *trigger*, not the cause — which is also why `--cpu-raster`
-avoids it. This renderer cannot fix it, and any change here claiming to would be
+machine, so the actual power-cut is still a platform, driver, or firmware
+defect. But it is no longer a guess that heavy sustained GPU work is the
+*trigger*: the machine spends the entire render within a degree or two of its
+thermal safety limit, with the platform's own protection circuitry intervening
+dozens of times. `--cpu-raster` avoids it because it keeps the GPU idle, so
+combined package power never approaches that ceiling. This renderer cannot fix
+a cooling/firmware limitation, and any change here claiming to would be
 guessing.
 
 What actually helps: use `--cpu-raster` for now (slower, but your work is
-already protected — frames are checkpointed individually, so a machine that dies
-mid-render loses nothing and re-running picks straight up); update the GPU
-driver; and stop the machine sleeping mid-render, since the standby transition
-is where every one of these died:
+already protected — frames are checkpointed individually, so a machine that
+dies mid-render loses nothing and re-running picks straight up); check for a
+BIOS/EC firmware update (thermal/power management bugs on new silicon like this
+are common in early revisions, and the external-vs-internal PROCHOT split
+suggests the EC's thermal policy specifically, not just raw cooling capacity);
+consider a cooling pad or a power-limit tool to cap sustained package power;
+and stop the machine sleeping mid-render, since standby transitions correlate
+with several of the historical crashes:
 
 ```
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 ```
 
-If you want it diagnosed properly, the Kernel-Power log alone is not enough —
-it does not carry display-driver or hardware-error events. Collect these
-instead, unfiltered:
+If you want to dig further yourself: log live sensors with HWiNFO
+(`CPU (Tctl/Tdie)`, `GPU Temperature`, `Thermal Throttling (PROCHOT EXT/CPU)`,
+`Throttle Reason - Thermal/Power`) during a `--raster gpu` render — that is
+what actually identified the cause here, where retroactive Event Log analysis
+alone could not. The WHEA-Logger channel is worth checking too, though on this
+machine it was never part of a default System log export:
 
 ```powershell
-Get-WinEvent -LogName System -MaxEvents 3000 |
-  Where-Object { $_.TimeCreated -gt (Get-Date).AddDays(-3) } |
-  Export-Csv system.csv -NoTypeInformation
 Get-WinEvent -LogName 'Microsoft-Windows-WHEA-Logger/Operational' -MaxEvents 200
-Get-ChildItem C:\Windows\LiveKernelReports -Recurse
-Get-ChildItem C:\Windows\Minidump
 ```
 
 **"It runs out of disk."** Add `--reap`.
