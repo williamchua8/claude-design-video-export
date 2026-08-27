@@ -725,6 +725,57 @@ duplicating frames. Render at a rate it actually hits.
 **"Text is soft."** You are probably exporting below the authored resolution.
 Either export at native size or add `--ss 2`.
 
+**"My machine hard-crashes or reboots during a long GPU render."** Stop rendering
+on the GPU path and use `--cpu-raster` until it is resolved. This is worth
+taking seriously and it is worth being precise about.
+
+Observed on a real machine (Asus laptop, AMD Radeon 890M): repeated unclean
+shutdowns during long 4K renders, and none on `--cpu-raster`. Reading its
+Windows event log gave a picture worth recording, because the obvious reading
+was wrong:
+
+- **They were not blue screens.** Every one logged `BugcheckCode: 0` — no stop
+  code, no crash dump, no WHEA hardware error, no long power-button press. A
+  real BSOD records a bugcheck. `BugcheckCode 0` is a hard hang or power-off
+  that Windows never got to catch, which is a *different* fault from a driver
+  crash and rules out most of what you would investigate for a BSOD.
+- **The fault predated the renderer.** 29 unclean shutdowns across eight months,
+  in every single month, long before this tool touched the machine.
+- **But the render amplified it enormously** — seven in one 52-minute evening
+  session against a baseline of about one a month.
+- **Every one involved Modern Standby**, bracketed by connected-standby entry
+  and exit events and followed by "standby budget exhausted".
+
+The honest conclusion: a user-space program should not be able to hard-kill a
+machine, so this is a platform, driver, or firmware defect. A heavy sustained
+GPU workload is the *trigger*, not the cause — which is also why `--cpu-raster`
+avoids it. This renderer cannot fix it, and any change here claiming to would be
+guessing.
+
+What actually helps: use `--cpu-raster` for now (slower, but your work is
+already protected — frames are checkpointed individually, so a machine that dies
+mid-render loses nothing and re-running picks straight up); update the GPU
+driver; and stop the machine sleeping mid-render, since the standby transition
+is where every one of these died:
+
+```
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+```
+
+If you want it diagnosed properly, the Kernel-Power log alone is not enough —
+it does not carry display-driver or hardware-error events. Collect these
+instead, unfiltered:
+
+```powershell
+Get-WinEvent -LogName System -MaxEvents 3000 |
+  Where-Object { $_.TimeCreated -gt (Get-Date).AddDays(-3) } |
+  Export-Csv system.csv -NoTypeInformation
+Get-WinEvent -LogName 'Microsoft-Windows-WHEA-Logger/Operational' -MaxEvents 200
+Get-ChildItem C:\Windows\LiveKernelReports -Recurse
+Get-ChildItem C:\Windows\Minidump
+```
+
 **"It runs out of disk."** Add `--reap`.
 
 **"I rendered a scene before this fix and now it wants to re-render everything."**
