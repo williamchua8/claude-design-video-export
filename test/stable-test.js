@@ -9,7 +9,7 @@
 // the picture is already stable (costing exactly one extra shot), keep shooting
 // while it changes, and give up rather than spin when it never settles.
 
-import { shootStable, makeStableState, stableNeedFor, stableObserve, PROBE_FRAMES, REPROBE_EVERY } from '../lib/capture.js';
+import { shootStable, makeStableState, stableNeedFor, stableObserve, PROBE_FRAMES, SPOT_CHECK_EVERY } from '../lib/capture.js';
 import { c } from '../lib/util.js';
 
 let failures = 0;
@@ -125,10 +125,16 @@ const drive = (st, n, bad = () => false) => {
 {
   // A machine that never misbehaves: probe, then run at full speed.
   const st = makeStableState({ stableCapture: 'auto' });
-  const needs = drive(st, 100);
+  const N = 400;
+  const needs = drive(st, N);
   const careful = needs.filter((n) => n >= 2).length;
-  check('a clean machine pays only for the probe, then runs at one shot',
-    careful === PROBE_FRAMES && st.mode === 'off', `careful=${careful} mode=${st.mode}`);
+  // Probe burst up front, then a spot check every SPOT_CHECK_EVERY frames. The
+  // number that matters is the ceiling: this must stay a few percent, not creep
+  // toward doubling every screenshot.
+  const budget = PROBE_FRAMES + Math.ceil((N - PROBE_FRAMES) / SPOT_CHECK_EVERY) + 1;
+  check('a clean machine settles to occasional spot checks, not every frame',
+    st.mode === 'off' && careful <= budget && careful < N * 0.12,
+    `careful=${careful} of ${N} (budget ${budget}) mode=${st.mode}`);
 }
 
 {
@@ -144,15 +150,15 @@ const drive = (st, n, bad = () => false) => {
   const st = makeStableState({ stableCapture: 'auto' });
   drive(st, PROBE_FRAMES + 5);
   check('sanity: it went to full speed first', st.mode === 'off');
-  const needs = drive(st, REPROBE_EVERY + 5, () => true);
-  check('a re-probe catches a machine that degrades later',
+  const needs = drive(st, SPOT_CHECK_EVERY + 5, () => true);
+  check('a spot check catches a machine that degrades later',
     st.mode === 'on', `mode=${st.mode}`);
   // The cost of insurance is what matters here: exactly one careful frame is
   // spent before the problem is found, not a steady tax on every frame.
   check('and costs exactly one careful frame to notice',
     needs.carefulBeforeOn === 1, `careful-before-on=${needs.carefulBeforeOn}`);
-  check('and left the ~250 frames before it at full speed',
-    needs.filter((n) => n === 1).length >= REPROBE_EVERY - 20,
+  check('and the frames before the catch were mostly full speed',
+    needs.filter((n) => n === 1).length >= SPOT_CHECK_EVERY - 6,
     `single-shot=${needs.filter((n) => n === 1).length} of ${needs.length}`);
 }
 
@@ -168,6 +174,21 @@ const drive = (st, n, bad = () => false) => {
   check('--no-stable-capture stays off', off.mode === 'off' && stableNeedFor(off) === 1);
   drive(off, 50);
   check('and never re-probes', stableNeedFor(off) === 1);
+}
+
+{
+  // The case that motivated spot-checking at all: a long render whose fragile
+  // scene arrives ~1500 frames in. Probing only the opening frames declares the
+  // machine clean and then never looks again, so the race is never sampled.
+  const st = makeStableState({ stableCapture: 'auto' });
+  const LATE = 1500;
+  const needs = drive(st, LATE + 200, (i) => i >= LATE);   // only misbehaves late
+  check('a scene that only misbehaves 1500 frames in is still caught',
+    st.mode === 'on', `mode=${st.mode}`);
+  const carefulEarly = needs.slice(PROBE_FRAMES, LATE).filter((n) => n >= 2).length;
+  check('and the sampling before it stayed cheap',
+    carefulEarly <= (LATE - PROBE_FRAMES) / SPOT_CHECK_EVERY + 2,
+    `careful=${carefulEarly} of ${LATE - PROBE_FRAMES} frames`);
 }
 
 console.log(`\n  ${failures ? c.r(`${failures} failed`) : c.g('all passed')}\n`);

@@ -307,7 +307,7 @@ tool says so.
 **What it looks like.** Panels, rows, or whole card bodies come out missing —
 not blank frames, just *part* of the composition absent, with the layout
 reflowed into the gap. It gets worse on faster machines with more parallelism,
-not better, and `--software` reduces it at the cost of section 7 below.
+not better, and `--software` reduces it at the cost of section 8 below.
 
 **What it actually is, measured.** Taking a real 402-frame Energy scene that
 exported with visible dropouts: 40 frames flagged, 9 more past the cap — about
@@ -411,11 +411,61 @@ and every one of those would have exported with content missing.
 **Other levers**, in the order worth trying: `--jobs` lower (less contention
 is less race), `--paint-determinism` (compositor flags that force paint to
 finish — off by default because they can deadlock the screenshot call), and
-`--cpu-raster` (section 7). Reach for `--software` last, for the reason below.
+`--cpu-raster` (section 8). Reach for `--software` last, for the reason below.
 
 ---
 
-### 7. `--software` hides elements that should be in front
+### 7. Compositions that are unusually prone to this
+
+Some layer trees make the paint race far likelier than others, and the pattern
+worth knowing is a **`filter` or `opacity` on a zero-sized element whose children
+overflow it enormously in 3D**:
+
+```jsx
+// fragile: the filter has no well-defined region to apply to
+<div style={{ left: '50%', top: '50%', width: 0, height: 0,
+              transformStyle: 'preserve-3d',
+              opacity: dim, filter: `saturate(${g}) brightness(${b})`,
+              transform: `... perspective(2600px) rotateX(...)` }}>
+  <Floor />                     {/* thousands of px, in 3D */}
+</div>
+```
+
+A filtered element gets its own rendering surface, and Chromium has to decide how
+big that surface is. Here the box is 0x0 and the content spills far past it in
+three dimensions, so the answer comes out of overflow estimation rather than the
+box — and it is decided per tile. That is what paints hard-edged rectangular
+seams into a soft gradient background.
+
+Splitting the two responsibilities fixes the ambiguity without touching the
+camera maths:
+
+```jsx
+// the filtered surface is a real, finite size...
+<div style={{ position: 'absolute', inset: 0, overflow: 'hidden',
+              opacity: dim, filter: `saturate(${g}) brightness(${b})` }}>
+  {/* ...and the 0x0 box goes back to only being a camera origin */}
+  <div style={{ position: 'absolute', left: '50%', top: '50%', width: 0, height: 0,
+                transformStyle: 'preserve-3d', transform: `...` }}>
+    <Floor />
+  </div>
+</div>
+```
+
+**Be careful how much you read into this.** Measured on a real 64s vertical reel:
+the scene using the fragile form rendered *two different pictures for one pinned
+frame* under parallel load — caught once in 6 shots, which is the paint race
+proven directly rather than inferred. The restructured form was never unstable.
+But the fault is rare (once in 54 shots of that frame), so "never unstable" is
+not the same as "proven fixed", and the restructure also shifts the rendered
+grade slightly (~2 mean grey levels, because Chromium applies the filter
+differently once the region is well-defined). Treat it as hardening worth doing,
+eyeball the grade afterwards, and keep `--stable-capture` as the thing that
+actually guarantees the frame.
+
+---
+
+### 8. `--software` hides elements that should be in front
 
 **What it looks like.** Switch to `--raster software` (or `--software`) — maybe
 because of the paint-dropout problem above — and a panel that should sit in
@@ -672,7 +722,7 @@ by default and should catch it. If a few still get through, force it on for
 every frame with `--stable-capture`, and raise `--stable-tries` if the report
 says frames "never settled". `--action doctor` confirms whether your machine
 has the fault at all. Do not reach for `--software`: it is steadier but breaks
-3D stacking (section 7).
+3D stacking (section 8).
 
 **"The doctor says my composition is not reachable from the virtual clock."**
 On a machine with the paint race that used to be a misdiagnosis — see section 6.
