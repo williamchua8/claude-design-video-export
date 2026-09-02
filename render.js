@@ -109,6 +109,7 @@ const OPT = {
   noConcurrent: has('--no-concurrent'),
   yes:       has('--yes') || has('-y'),
   help:      has('--help') || has('-h'),
+  version:   has('--version') || has('-v'),
 };
 
 const HELP = `
@@ -119,6 +120,10 @@ ${c.b('Claude Design -> MP4')}
 ${c.b('Input')}
   --input <path>        .html, a project folder, or a .zip from Claude Code.
                         Omit it and the current folder is searched.
+  --version             print what this copy is, and which fixes it contains.
+                        Run this first if a bug you were told was fixed is
+                        still happening: it reads the files on disk rather
+                        than trusting a version number.
 
 ${c.b('Output')}
   --res 4k|2k|1080p|native      target height (default 4k)
@@ -813,8 +818,57 @@ async function renderQueued(proj, bundle) {
   return { ...res, outFile: cfg.outFile };
 }
 
+/**
+ * What this checkout actually is.
+ *
+ * People copy this folder between machines, unzip it next to an older copy, or
+ * run it from a directory that is not the git clone they think it is -- and the
+ * symptom of running last month's code is identical to the symptom of the bug
+ * not being fixed. So report the version, the commit if there is one, and a
+ * direct read of whether each fix is present in the files on disk, rather than
+ * asking anyone to take a version number on trust.
+ */
+function versionReport() {
+  const read = (rel) => { try { return fs.readFileSync(path.join(__dirname, rel), 'utf8'); } catch { return ''; } };
+  let version = 'unknown';
+  try { version = JSON.parse(read('package.json')).version || version; } catch { /* not fatal */ }
+
+  let commit = null;
+  try {
+    const head = read('.git/HEAD').trim();
+    const ref = head.startsWith('ref: ') ? head.slice(5) : null;
+    const sha = ref ? (read('.git/' + ref).trim() || null) : head;
+    if (sha) commit = { sha: sha.slice(0, 7), branch: ref ? ref.replace('refs/heads/', '') : '(detached)' };
+  } catch { /* not a git checkout; the capability list below still answers the question */ }
+
+  const capture = read('lib/capture.js'), sweep = read('lib/sweep.js');
+  const spot = (capture.match(/SPOT_CHECK_EVERY\s*=\s*(\d+)/) || [])[1];
+  const caps = [
+    ['re-shoots half-drawn frames (--stable-capture)', /export async function shootStable/.test(capture)],
+    ['...on by default, adaptively', /PROBE_FRAMES/.test(capture)],
+    [`...spot-checks every ${spot || '?'} frames`, spot != null && Number(spot) <= 20],
+    ['scene frames numbered by full-video position', /frameOffset/.test(read('lib/pipeline.js'))],
+    ['one frame folder per composition', /export function framesDir/.test(read('lib/workspace.js'))],
+    ['render queue (--queue / --all)', /export async function runQueue/.test(read('lib/queue.js'))],
+    ['finds multi-frame dropouts', /maxRun/.test(sweep)],
+    ['finds dropouts inside fades and transitions', /export function detectOutliers/.test(sweep)],
+  ];
+
+  console.log(`\n  Claude Design -> MP4  v${version}`);
+  console.log(commit ? `  commit ${commit.sha} on ${commit.branch}` : '  not a git checkout (copied files)');
+  console.log(`  running from ${__dirname}\n`);
+  for (const [label, ok] of caps) console.log(`  ${ok ? c.g('yes') : c.y(' no')}  ${label}`);
+  if (caps.some(([, ok]) => !ok)) {
+    console.log(c.y('\n  Something above says no, so this copy is older than the code that fixed it.'));
+    console.log(c.y('  Update this folder before chasing the symptom any further.\n'));
+  } else {
+    console.log(c.dim('\n  Every fix is present in the files on disk.\n'));
+  }
+}
+
 (async () => {
   if (OPT.help) { console.log(HELP); return; }
+  if (OPT.version) { versionReport(); return; }
 
   if (!ffmpegBin()) {
     console.log(c.y('\n  Heads up: no ffmpeg found. Frames will still render, but nothing can be'));
