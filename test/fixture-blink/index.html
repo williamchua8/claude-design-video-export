@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CDV blink fixture</title>
+<!--
+  A composition that deliberately drops a large panel for exactly two frames at
+  24 fps (t = 1.000 .. 1.083). It exists so the dropout sweep's REPAIR path can
+  be exercised end to end: detect a two-frame run, re-render it, find that it
+  reproduces identically, and put the originals back rather than looping.
+  The dropout here is authored, so "kept, not repaired" is the correct outcome.
+-->
+<style>
+  html,body{margin:0;height:100%;background:#05070c;overflow:hidden}
+  #wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  #stage{position:relative;background:#05070c;transform-origin:center center;overflow:hidden}
+  #panel{position:absolute;left:20px;top:20px;width:280px;height:90px;background:#e8eefc;border-radius:8px}
+  #box{position:absolute;bottom:20px;width:50px;height:50px;background:#4f8cff;border-radius:8px}
+</style>
+<div id="wrap"><div id="stage" width="320" height="180"
+     data-om-exportable-video-with-duration-secs="2"
+     data-om-sync-seek="true" data-om-fonts-inlined="true">
+  <div id="panel"></div><div id="box"></div>
+</div></div>
+<script>
+(() => {
+  const stage = document.getElementById('stage');
+  const W = 320, H = 180, DUR = 2;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  stage.style.width = W + 'px'; stage.style.height = H + 'px';
+  stage.style.transform = 'scale(' + s + ')';
+  function applySeek(t) {
+    const u = Math.max(0, Math.min(1, t / DUR));
+    document.getElementById('box').style.left = (20 + u * 240) + 'px';
+    // frames 24 and 25 at 24 fps
+    const gone = t >= 0.9999 && t < 1.0834;
+    document.getElementById('panel').style.visibility = gone ? 'hidden' : 'visible';
+  }
+  stage.addEventListener('data-om-seek-to-time-frame', (e) => applySeek(e.detail.time));
+  applySeek(0);
+})();
+</script>
